@@ -1,0 +1,7 @@
+version=8.23.0
+build=8.23.0_9
+release_date=2026-10-14
+source=https://curl.se/windows/dl-8.23.0_9/curl-8.23.0_9-win64-mingw.zip
+zip_sha256=89cb71930f4242d884e8e349463455932ab1d089b20f4f99318261a3cbff9167
+curl.exe_sha256=3c871d76f592b7b2050c6070a293d296c9fd67a0b3d165b2fa4cd7d7e4a02f58
+libcurl-x64.dll_sha256=097a9d6f0b204deacf3953c43376bde1d012762c9798c238c69f60b006e44965
