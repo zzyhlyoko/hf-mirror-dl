@@ -1,0 +1,11 @@
+---
+description: Push this repository over SSH, not HTTPS
+alwaysApply: true
+---
+
+# Git remote uses SSH
+
+- Keep `origin` as an SSH URL (`git@github.com:<owner>/<repo>.git`). Do not switch it to HTTPS.
+- Do not write account names, home directories, key paths, or other machine-specific paths into the repository.
+- Push with `git push -u origin HEAD` only when the user asks. Do not force-push unless the user explicitly asks to rewrite history.
+- If Git cannot authenticate, use the operating system's OpenSSH for that one command via `GIT_SSH_COMMAND`. Do not change git config.

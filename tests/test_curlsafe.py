@@ -35,7 +35,7 @@ class BundledCurlTests(unittest.TestCase):
             os.environ["https_proxy"] = "http://127.0.0.1:9"
             os.environ["ALL_PROXY"] = "socks5h://127.0.0.1:9"
             os.environ["CURL_HOME"] = r"C:\proxy-config"
-            os.environ["USERPROFILE"] = r"C:\Users\someone"
+            os.environ["USERPROFILE"] = r"C:\not-a-profile"
             env = child_env()
         finally:
             os.environ.clear()

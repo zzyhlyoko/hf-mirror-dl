@@ -1,4 +1,4 @@
-# hfmd
+# hf-mirror-dl
 
 直连 [hf-mirror](https://hf-mirror.com/) 下载 Hugging Face 模型。程序自带一份固定的 curl，不使用系统代理，也不继承 `HTTP_PROXY` 这类环境变量。
 
@@ -91,3 +91,9 @@ python -m unittest discover -s tests
 ```
 
 测试在本机起一个假的镜像和一个会记录连接的代理，确认代理连接数是 0，并检查总带宽没有明显超过设定值。
+
+## 许可证
+
+本仓库的代码使用 [MIT License](LICENSE)。
+
+`third_party/curl/` 里的 curl 8.23.0 不是本仓库的代码，它保留上游的 curl 许可，见 `third_party/curl/COPYING.txt`。
