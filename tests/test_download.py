@@ -7,7 +7,7 @@ import unittest
 from pathlib import Path
 
 from hfmd.cli import main
-from hfmd.download import DownloadError, destination_for, download_model, parse_model
+from hfmd.download import DownloadError, RemoteFile, _plan, destination_for, download_model, parse_model
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -21,6 +21,16 @@ class ModelPathTests(unittest.TestCase):
             parse_model("org/../secret")
         dest = destination_for(ROOT / ".hfmd-test-home", "acme/tiny")
         self.assertEqual(dest, (ROOT / ".hfmd-test-home" / "acme" / "tiny").resolve())
+
+    def test_plan_does_not_redownload_finished_bytes(self) -> None:
+        size = 10 * 1024 * 1024
+        item = RemoteFile("weights.bin", size, None)
+        state = {"files": {"weights.bin": {"complete": False, "size": size, "sha256": None, "ranges": [[0, 4 * 1024 * 1024]]}}}
+        tasks = _plan([item], 4, state)
+        self.assertTrue(tasks)
+        self.assertTrue(all(task.start >= 4 * 1024 * 1024 for task in tasks))
+        self.assertEqual(tasks[0].start, 4 * 1024 * 1024)
+        self.assertEqual(tasks[-1].end, size)
 
     def test_cli_requires_concurrency_and_home(self) -> None:
         self.assertEqual(main(["download", "acme/tiny"]), 2)

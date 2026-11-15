@@ -37,7 +37,7 @@ class App:
         frame.columnconfigure(1, weight=1)
 
         self.model = tk.StringVar()
-        self.concurrency = tk.StringVar(value="8")
+        self.concurrency = tk.StringVar(value="32")
         self.bandwidth = tk.StringVar(value="300")
         self.home = tk.StringVar(value=str(Path.home() / "hf-models"))
         self.revision = tk.StringVar(value="main")

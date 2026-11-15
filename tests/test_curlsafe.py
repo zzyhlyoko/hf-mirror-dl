@@ -47,6 +47,26 @@ class BundledCurlTests(unittest.TestCase):
         self.assertNotIn("appdata", lowered)
         self.assertIn("SYSTEMROOT", {key.upper() for key in env})
 
+    def test_piece_command_keeps_proxy_off_and_has_no_per_connection_cap(self) -> None:
+        from hfmd.curlsafe import Piece, piece_command
+
+        pieces = [
+            Piece("https://hf-mirror.com/acme/tiny/resolve/main/a.bin", 0, 10, 20, Path("a.bin"), 0),
+            Piece("https://hf-mirror.com/acme/tiny/resolve/main/a.bin", 10, 20, 20, Path("a.bin"), 10),
+        ]
+        cmd = piece_command(
+            pieces,
+            allow_loopback_http=False,
+            header_paths=[Path("h0.txt"), Path("h1.txt")],
+            token=None,
+        )
+        self.assertEqual(cmd[1], "-q")
+        self.assertNotIn("--limit-rate", cmd)
+        self.assertEqual(cmd.count("--next"), 1)
+        self.assertGreaterEqual(cmd.count("--noproxy"), 2)
+        self.assertGreaterEqual(cmd.count("--proxy"), 2)
+        self.assertNotIn("--retry", cmd)
+
     def test_bundled_binary_reports_pinned_version(self) -> None:
         line = verify_bundled_curl()
         self.assertTrue(line.startswith(f"curl {PINNED_VERSION} "))
@@ -135,7 +155,6 @@ class DirectTransferTests(unittest.TestCase):
                 allow_loopback_http=True,
                 limiter=limiter,
                 cancel=None,
-                limit_rate=10_000_000,
             )
             self.assertEqual(dest.read_bytes(), payload)
             self.assertEqual(hits["proxy"], 0)
@@ -143,6 +162,102 @@ class DirectTransferTests(unittest.TestCase):
             os.environ.clear()
             os.environ.update(previous)
             dest.unlink(missing_ok=True)
+
+    def test_two_ranges_share_one_connection(self) -> None:
+        from hfmd.curlsafe import Piece, download_pieces
+
+        payload = bytes(range(256)) * 40
+        half = len(payload) // 2
+        seen = {"accepts": 0, "requests": 0}
+        server = _KeepAlive(payload, seen)
+        server.start()
+        self.addCleanup(server.stop)
+        dest = ROOT / ".hfmd-test" / "ranges.bin"
+        dest.parent.mkdir(exist_ok=True)
+        dest.write_bytes(b"\0" * len(payload))
+        url = f"http://127.0.0.1:{server.port}/file.bin"
+        try:
+            download_pieces(
+                [
+                    Piece(url, 0, half, len(payload), dest, 0),
+                    Piece(url, half, len(payload), len(payload), dest, half),
+                ],
+                token=None,
+                allow_loopback_http=True,
+                limiter=BandwidthLimiter(1_000 * 1_000_000),
+                cancel=None,
+            )
+            self.assertEqual(dest.read_bytes(), payload)
+        finally:
+            dest.unlink(missing_ok=True)
+        self.assertEqual(seen["requests"], 2)
+        self.assertEqual(seen["accepts"], 1, "the second range opened a new TCP connection")
+
+
+class _KeepAlive(threading.Thread):
+    def __init__(self, payload: bytes, seen: dict[str, int]) -> None:
+        super().__init__(daemon=True)
+        self.payload = payload
+        self.seen = seen
+        self._sock = socket.socket()
+        self._sock.bind(("127.0.0.1", 0))
+        self.port = self._sock.getsockname()[1]
+        self._sock.listen()
+        self._stop = False
+
+    def run(self) -> None:
+        self._sock.settimeout(0.2)
+        while not self._stop:
+            try:
+                conn, _addr = self._sock.accept()
+            except TimeoutError:
+                continue
+            except OSError:
+                break
+            self.seen["accepts"] += 1
+            threading.Thread(target=self._handle, args=(conn,), daemon=True).start()
+
+    def _handle(self, conn: socket.socket) -> None:
+        try:
+            conn.settimeout(2)
+            buffer = b""
+            while True:
+                while b"\r\n\r\n" not in buffer:
+                    chunk = conn.recv(4096)
+                    if not chunk:
+                        return
+                    buffer += chunk
+                head, buffer = buffer.split(b"\r\n\r\n", 1)
+                text = head.decode("latin1", "replace")
+                headers = {}
+                for line in text.split("\r\n")[1:]:
+                    if ":" in line:
+                        name, value = line.split(":", 1)
+                        headers[name.lower()] = value.strip()
+                start_text, end_text = headers["range"].split("=", 1)[1].split("-", 1)
+                start = int(start_text)
+                end = int(end_text)
+                body = self.payload[start : end + 1]
+                extra = (
+                    f"Content-Range: bytes {start}-{end}/{len(self.payload)}\r\n"
+                    "Accept-Ranges: bytes\r\n"
+                )
+                response = (
+                    "HTTP/1.1 206 Partial Content\r\n"
+                    f"Content-Length: {len(body)}\r\n"
+                    "Connection: keep-alive\r\n"
+                    f"{extra}\r\n"
+                ).encode("ascii") + body
+                conn.sendall(response)
+                self.seen["requests"] += 1
+        except (TimeoutError, OSError, KeyError):
+            return
+        finally:
+            conn.close()
+
+    def stop(self) -> None:
+        self._stop = True
+        self._sock.close()
 
 
 class _FileServer(threading.Thread):

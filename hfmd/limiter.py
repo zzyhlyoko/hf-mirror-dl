@@ -15,6 +15,8 @@ class BandwidthLimiter:
         self.capacity = max(self.bytes_per_second * 0.25, 32 * 1024)
         self.tokens = self.capacity
         self.updated = time.monotonic()
+        self.created = self.updated
+        self.waited = 0.0
         self._cv = threading.Condition()
 
     def acquire(self, nbytes: int) -> None:
@@ -26,6 +28,17 @@ class BandwidthLimiter:
             step = max(1, step)
             self._acquire_one(step)
             remaining -= step
+
+    def waiting_fraction(self) -> float:
+        """Share of elapsed time threads spent blocked on this bucket.
+
+        Many threads add their waits together, so the value can exceed 1 when
+        the cap is what is holding the transfers back.
+        """
+        elapsed = time.monotonic() - self.created
+        if elapsed < 0.5:
+            return 0.0
+        return self.waited / elapsed
 
     def refund(self, nbytes: int) -> None:
         if nbytes <= 0:
@@ -43,7 +56,9 @@ class BandwidthLimiter:
                     return
                 deficit = nbytes - self.tokens
                 wait = deficit / self.bytes_per_second
+                started = time.monotonic()
                 self._cv.wait(timeout=max(wait, 0.001))
+                self.waited += time.monotonic() - started
 
     def _refill(self) -> None:
         now = time.monotonic()

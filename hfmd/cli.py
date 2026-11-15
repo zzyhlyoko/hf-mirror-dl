@@ -48,7 +48,13 @@ def _parser() -> argparse.ArgumentParser:
 
     download = sub.add_parser("download", help="命令行下载，给其它 agent 调用")
     download.add_argument("model", help="模型名，格式 provider/model_name")
-    download.add_argument("-c", "--concurrency", type=int, required=True, help="并发连接数，1 到 64")
+    download.add_argument(
+        "-c",
+        "--concurrency",
+        type=int,
+        required=True,
+        help="并发上限，1 到 128。先开少量连接，总速度没到带宽上限再增加",
+    )
     download.add_argument(
         "-b",
         "--bandwidth-mbps",

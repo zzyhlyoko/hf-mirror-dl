@@ -36,9 +36,9 @@ download_home/provider/model_name/
 
 `--bandwidth-mbps` 的单位是 **Mbps（兆比特/秒）**。默认 **300**，也就是大约 37.5 MB/s。
 
-这是所有并发连接加在一起的上限。每个连接还有一份按并发数均分的 curl `--limit-rate`，共享的令牌桶再压住同时突发。验收时允许短时间波动。
+这是所有连接加在一起的上限，由一个共享的令牌桶执行。单条连接不再单独设限，避免慢连接占着额度、快连接却不能用。验收时允许短时间波动。
 
-hf-mirror 的 CDN 对单条连接有速度上限，所以用并发把多条连接叠起来。大文件会按 Range 切成多段，一起下载。
+hf-mirror 的 CDN 对单条连接很慢，所以要靠很多条连接叠速度。大文件按 Range 切开，每段最大 128 MiB。同一个 curl 进程会连续拉取最多 4 段，好让 TCP 连接复用，而不是每段都重新握手。程序先打开最多 8 条连接；如果总速度还低于上限，并且不是令牌桶在限速，就继续加连接，直到 `-c` 给出的上限。明显慢于其它连接的那一条会被关掉，这段改由新连接重下，同一段最多这样换 2 次。
 
 ## 图形界面
 
@@ -59,7 +59,7 @@ python -m hfmd gui
 给其它 agent 用：
 
 ```bat
-python -m hfmd download Qwen/Qwen2.5-7B-Instruct -c 8 -b 300 -d D:\models
+python -m hfmd download Qwen/Qwen2.5-7B-Instruct -c 32 -b 300 -d D:\models
 ```
 
 参数：
@@ -67,7 +67,7 @@ python -m hfmd download Qwen/Qwen2.5-7B-Instruct -c 8 -b 300 -d D:\models
 | 参数 | 含义 |
 | --- | --- |
 | `model` | `provider/model_name` |
-| `-c` / `--concurrency` | 并发连接数，1 到 64 |
+| `-c` / `--concurrency` | 并发上限，1 到 128。实际连接数从少量加到这个值 |
 | `-b` / `--bandwidth-mbps` | 总带宽，默认 300 Mbps |
 | `-d` / `--download-home` | 保存根目录 |
 | `--revision` | 默认 `main` |

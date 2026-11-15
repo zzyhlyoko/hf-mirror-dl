@@ -8,6 +8,7 @@ import math
 import os
 import queue
 import re
+import shutil
 import threading
 import time
 from collections import deque
@@ -19,9 +20,11 @@ from urllib.parse import quote, urljoin, urlsplit
 from hfmd.curlsafe import (
     Cancelled,
     CurlError,
+    Piece,
+    PieceFailed,
     RangeIgnored,
-    check_initial_url,
-    download_to_file,
+    SlowTransfer,
+    download_pieces,
     get_bytes,
     kill_all,
     system_proxy_enabled,
@@ -33,7 +36,11 @@ ENDPOINT = "https://hf-mirror.com"
 _MODEL_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,96}/[A-Za-z0-9][A-Za-z0-9._-]{0,96}$")
 _REVISION_RE = re.compile(r"[A-Za-z0-9._-]{1,128}")
 _MIN_CHUNK = 4 * 1024 * 1024
-_MAX_CHUNK = 32 * 1024 * 1024
+_MAX_CHUNK = 128 * 1024 * 1024
+_BATCH = 4
+_SLOW_TRIES = 2
+_INITIAL_WORKERS = 8
+_MAX_CONCURRENCY = 128
 
 
 class DownloadError(Exception):
@@ -52,6 +59,7 @@ class _Task:
     file: RemoteFile
     start: int
     end: int
+    tries: int = 0
 
 
 @dataclass
@@ -108,8 +116,8 @@ def download_model(
 ) -> Path:
     provider, name = parse_model(model)
     revision = parse_revision(revision)
-    if concurrency < 1 or concurrency > 64:
-        raise DownloadError("并发数必须是 1 到 64 的整数")
+    if concurrency < 1 or concurrency > _MAX_CONCURRENCY:
+        raise DownloadError(f"并发数必须是 1 到 {_MAX_CONCURRENCY} 的整数")
     if bandwidth_mbps <= 0 or bandwidth_mbps > 100_000:
         raise DownloadError("总带宽必须大于 0，单位是 Mbps（兆比特/秒）")
     if token is not None:
@@ -119,6 +127,9 @@ def download_model(
     dest.mkdir(parents=True, exist_ok=True)
     meta_dir = dest / ".hfmd"
     meta_dir.mkdir(exist_ok=True)
+    parts = meta_dir / "parts"
+    if parts.exists():
+        shutil.rmtree(parts, ignore_errors=True)
     verify_bundled_curl()
 
     def emit(phase: str, message: str, files_done: int = 0, files_total: int = 0,
@@ -152,8 +163,7 @@ def download_model(
     baseline = _completed_bytes(files, state)
     meter = _Meter()
     limiter = BandwidthLimiter(bandwidth_mbps * 1_000_000)
-    per_rate = max(1, math.ceil((bandwidth_mbps * 1_000_000 / 8) / concurrency))
-    tasks = [task for task in _plan(files, concurrency) if not _task_done(state, task)]
+    tasks = [task for task in _plan(files, concurrency, state) if not _task_done(state, task)]
     file_locks = {item.path: threading.Lock() for item in files}
     ignored: set[str] = set()
     errors: list[BaseException] = []
@@ -162,6 +172,7 @@ def download_model(
     work: queue.Queue[_Task | None] = queue.Queue()
     for task in tasks:
         work.put(task)
+    pace = _Pace()
 
     last_emit = 0.0
 
@@ -177,47 +188,121 @@ def download_model(
             message,
             done_files,
             len(files),
-            min(total_bytes, baseline + meter.session),
+            min(total_bytes, baseline + meter.done()),
             total_bytes,
             meter.speed_mbps(),
         )
 
-    def worker() -> None:
-        while True:
-            task = work.get()
+    def usable(task: _Task) -> bool:
+        if cancel.is_set() or errors:
+            return False
+        if task.file.path in ignored and not _whole(task):
+            return False
+        return not _task_done(state, task)
+
+    def give_up(seen: int, elapsed: float) -> bool:
+        if elapsed < 15 or seen < 0:
+            return False
+        key = threading.get_ident()
+        pace.publish(key, seen / elapsed)
+        peers, median = pace.median_others(key)
+        if peers < 2 or median < 250_000:
+            return False
+        if seen < 128 * 1024:
+            return True
+        return peers >= 4 and seen / elapsed < median * 0.25
+
+    def run_batch(batch: list[_Task]) -> None:
+        pending = [task for task in batch if usable(task)]
+        for task in pending:
+            if task.end != task.start:
+                continue
+            _mark_empty(task, dest, state, state_path, lock)
+            emit_progress(task.file.path)
+        pending = [task for task in pending if task.end > task.start]
+        if not pending:
+            return
+        allow_slow_kill = all(task.tries < _SLOW_TRIES for task in pending)
+        delay = 1.0
+        for attempt in range(1, 5):
+            if cancel.is_set():
+                raise Cancelled("已取消")
             try:
-                if task is None:
-                    return
-                if cancel.is_set() or errors:
-                    continue
-                if task.file.path in ignored and not _whole(task):
-                    continue
-                if _task_done(state, task):
-                    continue
-                _run_task(
-                    task,
+                _transfer_batch(
+                    pending,
                     dest=dest,
                     endpoint=endpoint,
                     revision=revision,
                     token=token,
                     allow_loopback_http=allow_loopback_http,
                     limiter=limiter,
-                    limit_rate=per_rate,
                     cancel=cancel,
                     state=state,
                     state_path=state_path,
                     state_lock=lock,
-                    file_lock=file_locks[task.file.path],
+                    file_locks=file_locks,
                     meter=meter,
-                    on_progress=lambda message: emit_progress(message),
+                    on_progress=emit_progress,
+                    give_up=give_up if allow_slow_kill else None,
                 )
-            except RangeIgnored:
+                return
+            except SlowTransfer as exc:
+                meter.drop(exc.written)
+                for task in pending[exc.index :]:
+                    work.put(_Task(task.file, task.start, task.end, task.tries + 1))
+                return
+            except RangeIgnored as exc:
+                meter.drop(exc.written)
+                failed = pending[min(exc.index, len(pending) - 1)]
                 with lock:
-                    if task.file.path not in ignored:
-                        ignored.add(task.file.path)
-                        _reset_file(dest, task.file, state)
+                    if failed.file.path not in ignored:
+                        ignored.add(failed.file.path)
+                        _reset_file(dest, failed.file, state)
                         _save_state(state_path, state)
-                        work.put(_Task(task.file, 0, task.file.size))
+                        work.put(_Task(failed.file, 0, failed.file.size))
+                return
+            except PieceFailed as exc:
+                meter.drop(exc.written)
+                pending = pending[exc.index :]
+                if not pending or attempt == 4:
+                    raise DownloadError(str(exc)) from exc
+                time.sleep(delay)
+                delay = min(delay * 2, 8)
+            except Cancelled:
+                raise
+            except CurlError:
+                if attempt == 4:
+                    raise
+                time.sleep(delay)
+                delay = min(delay * 2, 8)
+
+    def worker() -> None:
+        gate.acquire()
+        while True:
+            task = work.get()
+            if task is None:
+                work.task_done()
+                return
+            batch = [task]
+            try:
+                while len(batch) < _BATCH and batch[0].tries < _SLOW_TRIES:
+                    try:
+                        extra = work.get_nowait()
+                    except queue.Empty:
+                        break
+                    if extra is None:
+                        work.task_done()
+                        work.put(None)
+                        break
+                    if extra.tries >= _SLOW_TRIES:
+                        work.task_done()
+                        work.put(extra)
+                        break
+                    if not usable(extra):
+                        work.task_done()
+                        continue
+                    batch.append(extra)
+                run_batch(batch)
             except Cancelled:
                 cancel.set()
             except Exception as exc:  # noqa: BLE001 - keep the first worker error
@@ -225,20 +310,49 @@ def download_model(
                 cancel.set()
                 kill_all()
             finally:
-                work.task_done()
+                for _item in batch:
+                    work.task_done()
 
     if tasks:
+        count = max(1, min(concurrency, len(tasks)))
+        gate = threading.Semaphore(0)
+        finished = threading.Event()
         threads = [
             threading.Thread(target=worker, name=f"hfmd-{index}", daemon=True)
-            for index in range(max(1, min(concurrency, len(tasks))))
+            for index in range(count)
         ]
         for thread in threads:
             thread.start()
+        initial = min(_INITIAL_WORKERS, count)
+
+        def grow() -> None:
+            opened = initial
+            while opened < count and not finished.is_set():
+                if finished.wait(6):
+                    return
+                if cancel.is_set() or errors or work.empty():
+                    continue
+                if meter.speed_mbps() >= bandwidth_mbps * 0.8:
+                    continue
+                if limiter.waiting_fraction() >= 0.25:
+                    continue
+                step = min(8, count - opened)
+                for _permit in range(step):
+                    gate.release()
+                opened += step
+
+        for _permit in range(initial):
+            gate.release()
+        if initial < count:
+            threading.Thread(target=grow, name="hfmd-grow", daemon=True).start()
         work.join()
-        for _ in threads:
+        finished.set()
+        for _permit in threads:
+            gate.release()
+        for _permit in threads:
             work.put(None)
         for thread in threads:
-            thread.join(timeout=5)
+            thread.join(timeout=15)
     if cancel.is_set() and not errors:
         raise Cancelled("已取消")
     if errors:
@@ -431,9 +545,15 @@ def _safe_rel(path: str) -> str:
     return "/".join(parts)
 
 
-def _plan(files: list[RemoteFile], concurrency: int) -> list[_Task]:
+def _plan(files: list[RemoteFile], concurrency: int, state: dict) -> list[_Task]:
     tasks: list[_Task] = []
+    saved = state.get("files") or {}
     for item in files:
+        record = saved.get(item.path) if isinstance(saved, dict) else None
+        if not isinstance(record, dict):
+            record = {}
+        if record.get("complete") and record.get("size") == item.size:
+            continue
         if item.size <= 0:
             tasks.append(_Task(item, 0, 0))
             continue
@@ -441,12 +561,25 @@ def _plan(files: list[RemoteFile], concurrency: int) -> list[_Task]:
         if item.size > _MIN_CHUNK and concurrency > 1:
             fair = math.ceil(item.size / concurrency)
             piece = max(_MIN_CHUNK, min(_MAX_CHUNK, fair))
-        start = 0
-        while start < item.size:
-            end = min(item.size, start + piece)
-            tasks.append(_Task(item, start, end))
-            start = end
+        for hole_start, hole_end in _holes(record.get("ranges") or [], item.size):
+            start = hole_start
+            while start < hole_end:
+                end = min(hole_end, start + piece)
+                tasks.append(_Task(item, start, end))
+                start = end
     return tasks
+
+
+def _holes(ranges: list, size: int) -> list[tuple[int, int]]:
+    cursor = 0
+    holes: list[tuple[int, int]] = []
+    for start, end in sorted((int(pair[0]), int(pair[1])) for pair in ranges):
+        if start > cursor:
+            holes.append((cursor, start))
+        cursor = max(cursor, end)
+    if cursor < size:
+        holes.append((cursor, size))
+    return holes
 
 
 def _whole(task: _Task) -> bool:
@@ -536,8 +669,28 @@ def _local_path(dest: Path, rel: str) -> Path:
     return path
 
 
-def _run_task(
-    task: _Task,
+def _mark_empty(task: _Task, dest: Path, state: dict, state_path: Path, state_lock: threading.Lock) -> None:
+    target = _local_path(dest, task.file.path)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_bytes(b"")
+    with state_lock:
+        record = _record(state, task.file)
+        record["complete"] = True
+        _save_state(state_path, state)
+
+
+def _ensure_size(dest: Path, task: _Task, file_lock: threading.Lock) -> Path:
+    target = _local_path(dest, task.file.path)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    with file_lock:
+        if not target.exists() or target.stat().st_size != task.file.size:
+            with target.open("wb") as handle:
+                handle.truncate(task.file.size)
+    return target
+
+
+def _transfer_batch(
+    tasks: list[_Task],
     *,
     dest: Path,
     endpoint: str,
@@ -545,92 +698,53 @@ def _run_task(
     token: str | None,
     allow_loopback_http: bool,
     limiter: BandwidthLimiter,
-    limit_rate: int,
     cancel: threading.Event,
     state: dict,
     state_path: Path,
     state_lock: threading.Lock,
-    file_lock: threading.Lock,
+    file_locks: dict[str, threading.Lock],
     meter: _Meter,
     on_progress: Callable[[str], None],
+    give_up: Callable[[int, float], bool] | None,
 ) -> None:
-    target = _local_path(dest, task.file.path)
-    target.parent.mkdir(parents=True, exist_ok=True)
-    if task.end == task.start:
-        target.write_bytes(b"")
+    pieces: list[Piece] = []
+    for task in tasks:
+        target = _ensure_size(dest, task, file_locks[task.file.path])
+        url = (
+            f"{endpoint}/{_repo_path(state['model'])}/resolve/"
+            f"{quote(revision, safe='')}/{quote(task.file.path, safe='/')}"
+        )
+        pieces.append(Piece(url, task.start, task.end, task.file.size, target, task.start))
+
+    def on_done(index: int) -> None:
+        task = tasks[index]
+        target = _local_path(dest, task.file.path)
         with state_lock:
             record = _record(state, task.file)
-            record["complete"] = True
+            ranges = [tuple(pair) for pair in record.get("ranges") or []]
+            ranges.append((task.start, task.end))
+            record["ranges"] = _merge_ranges(ranges)
+            if _covers(record["ranges"], task.file.size):
+                record["complete"] = _hash_matches(target, task.file)
+                if not record["complete"] and task.file.sha256:
+                    target.unlink(missing_ok=True)
+                    record["ranges"] = []
+                    _save_state(state_path, state)
+                    raise DownloadError(f"校验失败：{task.file.path}")
             _save_state(state_path, state)
+        meter.commit(task.end - task.start)
         on_progress(task.file.path)
-        return
-    with file_lock:
-        if not target.exists() or target.stat().st_size > task.file.size:
-            with target.open("wb") as handle:
-                handle.truncate(task.file.size)
-        elif target.stat().st_size < task.file.size:
-            with target.open("r+b") as handle:
-                handle.truncate(task.file.size)
-    url = f"{endpoint}/{_repo_path(state['model'])}/resolve/{quote(revision, safe='')}/{quote(task.file.path, safe='/')}"
-    part_dir = dest / ".hfmd" / "parts"
-    part_dir.mkdir(parents=True, exist_ok=True)
-    part = part_dir / f"{_part_name(task)}.part"
-    delay = 1.0
-    for attempt in range(1, 5):
-        if cancel.is_set():
-            raise Cancelled("已取消")
-        try:
-            download_to_file(
-                url,
-                part,
-                start=task.start,
-                end=task.end,
-                total_size=task.file.size,
-                token=token,
-                allow_loopback_http=allow_loopback_http,
-                limiter=limiter,
-                cancel=cancel,
-                limit_rate=limit_rate,
-                on_chunk=meter.add,
-            )
-            break
-        except RangeIgnored:
-            part.unlink(missing_ok=True)
-            raise
-        except Cancelled:
-            part.unlink(missing_ok=True)
-            raise
-        except CurlError:
-            part.unlink(missing_ok=True)
-            if attempt == 4:
-                raise
-            time.sleep(delay)
-            delay = min(delay * 2, 8)
-    with file_lock:
-        with target.open("r+b") as out, part.open("rb") as src:
-            out.seek(task.start)
-            while True:
-                chunk = src.read(1024 * 1024)
-                if not chunk:
-                    break
-                out.write(chunk)
-            out.flush()
-            os.fsync(out.fileno())
-    part.unlink(missing_ok=True)
-    with state_lock:
-        record = _record(state, task.file)
-        ranges = [tuple(pair) for pair in record.get("ranges") or []]
-        ranges.append((task.start, task.end))
-        record["ranges"] = _merge_ranges(ranges)
-        if _covers(record["ranges"], task.file.size):
-            record["complete"] = _hash_matches(target, task.file)
-            if not record["complete"] and task.file.sha256:
-                target.unlink(missing_ok=True)
-                record["ranges"] = []
-                _save_state(state_path, state)
-                raise DownloadError(f"校验失败：{task.file.path}")
-        _save_state(state_path, state)
-    on_progress(task.file.path)
+
+    download_pieces(
+        pieces,
+        token=token,
+        allow_loopback_http=allow_loopback_http,
+        limiter=limiter,
+        cancel=cancel,
+        on_chunk=meter.add,
+        on_piece_done=on_done,
+        give_up=give_up,
+    )
 
 
 def _verify_file(dest: Path, item: RemoteFile, state: dict, state_path: Path) -> None:
@@ -677,24 +791,35 @@ def _merge_ranges(ranges: list[tuple[int, int]]) -> list[list[int]]:
     return merged
 
 
-def _part_name(task: _Task) -> str:
-    flat = task.file.path.replace("/", "__")
-    return f"{flat}-{task.start}-{task.end}"
-
-
 class _Meter:
     def __init__(self) -> None:
-        self.session = 0
+        self._received = 0
+        self._committed = 0
+        self._inflight = 0
         self._samples: deque[tuple[float, int]] = deque()
         self._lock = threading.Lock()
 
     def add(self, nbytes: int) -> None:
         now = time.monotonic()
         with self._lock:
-            self.session += nbytes
-            self._samples.append((now, self.session))
+            self._received += nbytes
+            self._inflight += nbytes
+            self._samples.append((now, self._received))
             while self._samples and now - self._samples[0][0] > 2:
                 self._samples.popleft()
+
+    def commit(self, nbytes: int) -> None:
+        with self._lock:
+            self._inflight -= nbytes
+            self._committed += nbytes
+
+    def drop(self, nbytes: int) -> None:
+        with self._lock:
+            self._inflight -= nbytes
+
+    def done(self) -> int:
+        with self._lock:
+            return self._committed + max(0, self._inflight)
 
     def speed_mbps(self) -> float:
         with self._lock:
@@ -706,3 +831,26 @@ class _Meter:
             if elapsed < 0.2:
                 return 0.0
             return (end_b - start_b) * 8 / elapsed / 1_000_000
+
+
+class _Pace:
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._rates: dict[int, tuple[float, float]] = {}
+
+    def publish(self, key: int, bps: float) -> None:
+        now = time.monotonic()
+        with self._lock:
+            self._rates[key] = (now, bps)
+            stale = [item for item, (stamp, _bps) in self._rates.items() if now - stamp > 20]
+            for item in stale:
+                del self._rates[item]
+
+    def median_others(self, key: int) -> tuple[int, float]:
+        now = time.monotonic()
+        with self._lock:
+            samples = [bps for item, (stamp, bps) in self._rates.items() if item != key and now - stamp <= 20]
+        if not samples:
+            return 0, 0.0
+        samples.sort()
+        return len(samples), samples[len(samples) // 2]

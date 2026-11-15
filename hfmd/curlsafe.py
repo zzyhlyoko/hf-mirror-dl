@@ -66,6 +66,34 @@ class Cancelled(CurlError):
 class RangeIgnored(CurlError):
     """The server answered a partial Range with the whole object."""
 
+    def __init__(self, message: str, index: int = 0, written: int = 0) -> None:
+        super().__init__(message)
+        self.index = index
+        self.written = written
+
+
+class PieceFailed(CurlError):
+    """One piece in a multi-range curl process failed. Earlier pieces are kept."""
+
+    def __init__(self, message: str, index: int = 0, written: int = 0) -> None:
+        super().__init__(message)
+        self.index = index
+        self.written = written
+
+
+class SlowTransfer(PieceFailed):
+    """This connection is far behind the others, so its process was closed."""
+
+
+@dataclass(frozen=True)
+class Piece:
+    url: str
+    start: int
+    end: int
+    total_size: int
+    dest: Path
+    offset: int
+
 
 @dataclass
 class TransferResult:
@@ -175,7 +203,6 @@ def get_bytes(
             header_path=header_path,
             stdout_path=body_path,
             range_header=None,
-            limit_rate=None,
         )
         try:
             _wait_proc(proc, cancel, timeout=120)
@@ -203,36 +230,137 @@ def download_to_file(
     allow_loopback_http: bool,
     limiter: BandwidthLimiter,
     cancel: threading.Event | None,
-    limit_rate: int,
     stall_seconds: float = 60,
     on_chunk: callable | None = None,
 ) -> TransferResult:
-    """Download bytes [start, end) into dest, throttled by the shared limiter.
-
-    Partial requests that come back as HTTP 200 are rejected with RangeIgnored
-    so the caller can fall back to a single full-file transfer.
-    """
-    if end < start:
-        raise CurlError("invalid range")
-    expected = end - start
-    if expected == 0:
-        dest.write_bytes(b"")
-        return TransferResult(status=200, nbytes=0, headers={}, path=dest)
-    check_initial_url(url, allow_loopback_http=allow_loopback_http)
-    header_path, _unused = _temp_pair("hfmd-hdr")
-    _unused.unlink(missing_ok=True)
-    dest.parent.mkdir(parents=True, exist_ok=True)
-    partial = not (start == 0 and end == total_size)
-    range_header = f"{start}-{end - 1}" if partial else None
-    proc = _popen(
-        url,
+    """Download bytes [start, end) into a new file, throttled by the shared limiter."""
+    piece = Piece(
+        url=url,
+        start=start,
+        end=end,
+        total_size=total_size,
+        dest=dest,
+        offset=0,
+    )
+    status, headers, nbytes = download_pieces(
+        [piece],
         token=token,
         allow_loopback_http=allow_loopback_http,
-        header_path=header_path,
-        stdout_path=None,
-        range_header=range_header,
-        limit_rate=limit_rate,
+        limiter=limiter,
+        cancel=cancel,
+        stall_seconds=stall_seconds,
+        on_chunk=on_chunk,
+        discard_on_failure=True,
     )
+    return TransferResult(status=status, nbytes=nbytes, headers=headers, path=dest)
+
+
+def piece_command(
+    pieces: list[Piece],
+    *,
+    allow_loopback_http: bool,
+    header_paths: list[Path],
+    token: str | None,
+) -> list[str]:
+    """One curl process, several ranges, so the TCP connection can be reused.
+
+    --next puts curl back to defaults, which would drop the proxy lock.
+    Every range repeats --noproxy, --proxy "", and the protocol lock.
+    There is no --limit-rate: a slow connection must not freeze the budget
+    of a faster one. The shared token bucket is the only cap.
+    """
+    if token and ("\r" in token or "\n" in token):
+        raise CurlError("token 含有换行，已拒绝")
+    proto = "=http,https" if allow_loopback_http else "=https"
+    cmd = command_prefix(allow_loopback_http=allow_loopback_http)
+    for index, piece in enumerate(pieces):
+        if index:
+            cmd.append("--next")
+        partial = not (piece.start == 0 and piece.end == piece.total_size)
+        cmd += [
+            "--location",
+            "--fail-with-body",
+            "--silent",
+            "--show-error",
+            "--connect-timeout",
+            "20",
+            "--noproxy",
+            "*",
+            "--proxy",
+            "",
+            "--proto",
+            proto,
+            "--proto-redir",
+            proto,
+            "-A",
+            "hfmd/1.0",
+            "-D",
+            str(header_paths[index]),
+            "--output",
+            "-",
+        ]
+        if partial:
+            cmd += ["--range", f"{piece.start}-{piece.end - 1}"]
+        if token:
+            cmd += ["-H", f"Authorization: Bearer {token}"]
+        cmd.append(piece.url)
+    return cmd
+
+
+def download_pieces(
+    pieces: list[Piece],
+    *,
+    token: str | None,
+    allow_loopback_http: bool,
+    limiter: BandwidthLimiter,
+    cancel: threading.Event | None,
+    stall_seconds: float = 60,
+    on_chunk: callable | None = None,
+    on_piece_done: callable | None = None,
+    give_up: callable | None = None,
+    discard_on_failure: bool = False,
+) -> tuple[int, dict[str, str], int]:
+    """Download pieces in order on one curl process.
+
+    Returns the status, headers, and size of the last piece.
+    Earlier pieces are flushed and reported through on_piece_done before the
+    next range is read, so a later failure does not drop them.
+    """
+    if not pieces:
+        raise CurlError("没有要下载的分片")
+    for piece in pieces:
+        if piece.end < piece.start:
+            raise CurlError("invalid range")
+        check_initial_url(piece.url, allow_loopback_http=allow_loopback_http)
+        piece.dest.parent.mkdir(parents=True, exist_ok=True)
+    if len(pieces) == 1 and pieces[0].end == pieces[0].start:
+        pieces[0].dest.write_bytes(b"")
+        if on_piece_done is not None:
+            on_piece_done(0)
+        return 200, {}, 0
+
+    header_paths: list[Path] = []
+    for _piece in pieces:
+        header_path, _unused = _temp_pair("hfmd-hdr")
+        _unused.unlink(missing_ok=True)
+        header_paths.append(header_path)
+    cmd = piece_command(
+        pieces,
+        allow_loopback_http=allow_loopback_http,
+        header_paths=header_paths,
+        token=token,
+    )
+    verify_bundled_curl()
+    proc = subprocess.Popen(
+        cmd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        env=child_env(),
+        creationflags=_creation_flags(),
+    )
+    with _procs_lock:
+        _procs.add(proc)
+    _attach_stderr(proc)
     assert proc.stdout is not None
     incoming: queue.Queue[bytes | BaseException | None] = queue.Queue(maxsize=1)
     reader = threading.Thread(
@@ -242,28 +370,31 @@ def download_to_file(
         daemon=True,
     )
     reader.start()
-    failed = False
+    last_status = 0
+    last_headers: dict[str, str] = {}
+    last_nbytes = 0
+    leftover = bytearray()
     try:
-        got = _consume(
-            proc,
-            incoming,
-            dest,
-            expected=expected,
-            partial=partial,
-            header_path=header_path,
-            limiter=limiter,
-            cancel=cancel,
-            stall_seconds=stall_seconds,
-            on_chunk=on_chunk,
-        )
-    except Exception:
-        failed = True
-        if proc.poll() is None:
-            proc.kill()
-        dest.unlink(missing_ok=True)
-        raise
+        for index, piece in enumerate(pieces):
+            last_status, last_headers, last_nbytes = _read_piece(
+                proc,
+                incoming,
+                piece,
+                index=index,
+                header_path=header_paths[index],
+                limiter=limiter,
+                cancel=cancel,
+                stall_seconds=stall_seconds,
+                on_chunk=on_chunk,
+                give_up=give_up,
+                discard_on_failure=discard_on_failure and len(pieces) == 1,
+                leftover=leftover,
+            )
+            if on_piece_done is not None:
+                on_piece_done(index)
+        return last_status, last_headers, last_nbytes
     finally:
-        if failed and proc.poll() is None:
+        if proc.poll() is None:
             proc.kill()
         deadline = time.monotonic() + 5
         while reader.is_alive() and time.monotonic() < deadline:
@@ -273,21 +404,8 @@ def download_to_file(
                 time.sleep(0.01)
         reader.join(timeout=1)
         _finish(proc)
-    status, headers = _final_headers(header_path)
-    header_path.unlink(missing_ok=True)
-    if status is None:
-        raise CurlError("curl 没有返回 HTTP 状态")
-    if status >= 400:
-        raise CurlError(f"HTTP {status}")
-    if partial and status != 206:
-        dest.unlink(missing_ok=True)
-        raise RangeIgnored(f"分段请求得到 HTTP {status}，服务器没有按 Range 返回")
-    if got != expected:
-        dest.unlink(missing_ok=True)
-        raise CurlError(f"下载长度不符：期望 {expected} 字节，得到 {got} 字节")
-    if status == 206:
-        _check_content_range(headers, start, end, total_size)
-    return TransferResult(status=status, nbytes=got, headers=headers, path=dest)
+        for header_path in header_paths:
+            header_path.unlink(missing_ok=True)
 
 
 def check_initial_url(url: str, *, allow_loopback_http: bool) -> None:
@@ -344,7 +462,6 @@ def _popen(
     header_path: Path,
     stdout_path: Path | None,
     range_header: str | None,
-    limit_rate: int | None,
 ) -> subprocess.Popen[bytes]:
     verify_bundled_curl()
     cmd = command_prefix(allow_loopback_http=allow_loopback_http)
@@ -365,8 +482,6 @@ def _popen(
         "-D",
         str(header_path),
     ]
-    if limit_rate is not None and limit_rate > 0:
-        cmd += ["--limit-rate", str(int(limit_rate))]
     if range_header is not None:
         cmd += ["--range", range_header]
     if token:
@@ -442,47 +557,210 @@ def _read_stdout(stdout, incoming: queue.Queue[bytes | BaseException | None]) ->
         incoming.put(exc)
 
 
-def _consume(
+def _read_piece(
     proc: subprocess.Popen[bytes],
     incoming: queue.Queue[bytes | BaseException | None],
-    dest: Path,
+    piece: Piece,
     *,
-    expected: int,
-    partial: bool,
+    index: int,
     header_path: Path,
     limiter: BandwidthLimiter,
     cancel: threading.Event | None,
     stall_seconds: float,
     on_chunk,
-) -> int:
-    got = 0
-    with dest.open("wb") as handle:
-        while got < expected:
+    give_up,
+    discard_on_failure: bool,
+    leftover: bytearray,
+) -> tuple[int, dict[str, str], int]:
+    expected = piece.end - piece.start
+    partial = not (piece.start == 0 and piece.end == piece.total_size)
+    buf = bytearray()
+    written = 0
+    started = time.monotonic()
+    checked = False
+    status: int | None = None
+    headers: dict[str, str] = {}
+    mode = "wb" if discard_on_failure else "r+b"
+    handle = piece.dest.open(mode)
+    try:
+        if mode == "r+b":
+            handle.seek(piece.offset)
+        while written < expected:
             if cancel is not None and cancel.is_set():
                 proc.kill()
                 raise Cancelled("已取消")
-            status, _headers = _peek_status(header_path)
+            status, headers, _seen = _status_after(header_path, 0)
             if partial and status == 200:
                 proc.kill()
-                raise RangeIgnored("服务器忽略了 Range")
-            try:
-                item = incoming.get(timeout=stall_seconds)
-            except queue.Empty:
+                raise RangeIgnored("服务器忽略了 Range", index, written)
+            if status is not None and status >= 400:
                 proc.kill()
-                raise CurlError(f"{int(stall_seconds)} 秒没有收到数据，已断开这次传输")
-            if isinstance(item, BaseException):
-                raise CurlError(str(item)) from item
-            if item is None:
+                raise PieceFailed(f"HTTP {status}", index, written)
+            if status == 206 and not checked:
+                try:
+                    _check_content_range(headers, piece.start, piece.end, piece.total_size)
+                except CurlError as exc:
+                    proc.kill()
+                    raise PieceFailed(str(exc), index, written) from exc
+                checked = True
+            if status is not None and status not in {200, 206}:
+                proc.kill()
+                raise PieceFailed(f"HTTP {status}", index, written)
+            if give_up is not None and give_up(written + len(buf), time.monotonic() - started):
+                proc.kill()
+                raise SlowTransfer("这条连接明显慢于其它连接，已换一条", index, written)
+            if status in {200, 206} and (buf or leftover):
+                pending = bytes(leftover) + bytes(buf)
+                leftover.clear()
+                buf.clear()
+                _accept_body(handle, pending, expected, written, leftover, limiter, on_chunk)
+                written += min(len(pending), expected - written)
+                if written >= expected:
+                    break
+                continue
+            if written >= expected:
                 break
-            piece = item
-            if got + len(piece) > expected:
-                piece = piece[: expected - got]
-            limiter.acquire(len(piece))
-            handle.write(piece)
-            got += len(piece)
-            if on_chunk is not None and piece:
-                on_chunk(len(piece))
-    return got
+            if leftover:
+                item = bytes(leftover)
+                leftover.clear()
+            else:
+                try:
+                    item = incoming.get(timeout=stall_seconds)
+                except queue.Empty:
+                    proc.kill()
+                    raise PieceFailed(f"{int(stall_seconds)} 秒没有收到数据，已断开这次传输", index, written)
+                if isinstance(item, BaseException):
+                    raise PieceFailed(str(item), index, written) from item
+                if item is None:
+                    break
+            if status in {200, 206}:
+                before = written
+                _accept_body(handle, item, expected, written, leftover, limiter, on_chunk)
+                written += min(len(item), expected - before)
+            else:
+                buf.extend(item)
+                if len(buf) > 1024 * 1024:
+                    proc.kill()
+                    raise PieceFailed("没有收到 HTTP 状态", index, written)
+        if status is None:
+            status, headers, _seen = _status_after(header_path, 0)
+        if partial and status == 200:
+            proc.kill()
+            raise RangeIgnored("服务器忽略了 Range", index, written)
+        if status == 206 and not checked:
+            try:
+                _check_content_range(headers, piece.start, piece.end, piece.total_size)
+            except CurlError as exc:
+                proc.kill()
+                raise PieceFailed(str(exc), index, written) from exc
+            checked = True
+        if status in {200, 206} and buf:
+            pending = bytes(buf)
+            buf.clear()
+            before = written
+            _accept_body(handle, pending, expected, written, leftover, limiter, on_chunk)
+            written += min(len(pending), expected - before)
+        if written != expected:
+            proc.kill()
+            detail = _stderr_text(proc).splitlines()
+            tail = detail[-1] if detail else "连接在分片完成前关闭"
+            if "http://" in tail or "https://" in tail:
+                tail = "连接在分片完成前关闭"
+            raise PieceFailed(tail, index, written)
+        if status is None:
+            status, headers, _seen = _status_after(header_path, 0)
+        if status is None:
+            proc.kill()
+            raise PieceFailed("curl 没有返回 HTTP 状态", index, written)
+        if partial and status != 206:
+            proc.kill()
+            raise RangeIgnored(f"分段请求得到 HTTP {status}，服务器没有按 Range 返回", index, written)
+        handle.flush()
+        os.fsync(handle.fileno())
+        return status, headers, written
+    except Exception:
+        if discard_on_failure:
+            handle.close()
+            piece.dest.unlink(missing_ok=True)
+        raise
+    finally:
+        if not handle.closed:
+            handle.close()
+
+
+def _accept_body(handle, payload: bytes, expected: int, written: int, leftover: bytearray, limiter: BandwidthLimiter, on_chunk) -> None:
+    need = expected - written
+    if need < 0:
+        need = 0
+    chunk = payload[:need]
+    rest = payload[need:]
+    if chunk:
+        _write_limited(handle, chunk, limiter, on_chunk)
+    if rest:
+        leftover.extend(rest)
+
+
+def _write_limited(handle, payload: bytes, limiter: BandwidthLimiter, on_chunk) -> None:
+    view = memoryview(payload)
+    while view:
+        step = view[:_READ_SIZE]
+        limiter.acquire(len(step))
+        handle.write(step)
+        if on_chunk is not None and step:
+            on_chunk(len(step))
+        view = view[len(step) :]
+
+
+def _status_after(header_path: Path, skip: int) -> tuple[int | None, dict[str, str], int]:
+    if not header_path.exists():
+        return None, {}, 0
+    try:
+        text = header_path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return None, {}, 0
+    blocks = _header_blocks(text)
+    if len(blocks) < skip:
+        skip = 0
+    status: int | None = None
+    headers: dict[str, str] = {}
+    consumed = skip
+    for offset, (code, found) in enumerate(blocks[skip:]):
+        if code in {301, 302, 303, 307, 308}:
+            continue
+        status, headers = code, found
+        consumed = skip + offset + 1
+        break
+    return status, headers, consumed
+
+
+def _header_blocks(text: str) -> list[tuple[int, dict[str, str]]]:
+    raw: list[list[str]] = []
+    current: list[str] = []
+    for line in text.splitlines():
+        if line.startswith("HTTP/") and current:
+            raw.append(current)
+            current = [line]
+        elif line.startswith("HTTP/") or current:
+            current.append(line)
+    if current:
+        raw.append(current)
+    parsed: list[tuple[int, dict[str, str]]] = []
+    for block in raw:
+        parts = block[0].split()
+        if len(parts) < 2 or not parts[0].startswith("HTTP/"):
+            continue
+        try:
+            code = int(parts[1])
+        except ValueError:
+            continue
+        headers: dict[str, str] = {}
+        for line in block[1:]:
+            if ":" not in line:
+                continue
+            name, value = line.split(":", 1)
+            headers[name.strip().lower()] = value.strip()
+        parsed.append((code, headers))
+    return parsed
 
 
 def _peek_status(header_path: Path) -> tuple[int | None, dict[str, str]]:
