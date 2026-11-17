@@ -1,2 +1,4 @@
 *.exe binary
 *.dll binary
+third_party/curl/macos-arm64/curl binary
+*.command text eol=lf

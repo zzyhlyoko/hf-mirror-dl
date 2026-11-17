@@ -138,7 +138,7 @@ def download_model(
             return
         progress(Progress(phase, files_done, files_total, bytes_done, bytes_total, speed, message, str(dest)))
 
-    note = "Windows 系统代理开着，但下载不会使用它。" if system_proxy_enabled() else "未使用系统代理。"
+    note = "系统代理开着，但下载不会使用它。" if system_proxy_enabled() else "未使用系统代理。"
     emit("start", f"直连 {endpoint}。内置 curl，代理已屏蔽。{note}")
     if cancel is not None and cancel.is_set():
         raise Cancelled("已取消")

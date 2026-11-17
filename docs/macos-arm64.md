@@ -1,10 +1,15 @@
 # Apple 芯片（arm64）开发方案
 
-状态：方案。本分支还没有 Mac 可执行文件，也还没有平台分支代码。
+状态：实现已在本分支。Apple 芯片的 curl 二进制、SHA256 和平台分支代码都在这里。请在 Mac 上拉取 `dev/macos-arm64` 后测试，不要合并到 `master`。
+
+Mac 上要做的事：
+
+1. `python3 -W error::ResourceWarning -m unittest discover -s tests`
+2. 用内置 curl 在代理环境变量指向一个没有进程监听的本机端口时，访问 `https://hf-mirror.com/`。退出码是 0，那个端口的连接数是 0。
+3. 可选：下载一个公开小模型到仓库已忽略的 `downloads/`，确认退出码 0 后删掉该目录。
+4. 若系统因为没有签名或隔离属性拒绝运行二进制，在仓库目录执行 `xattr -d com.apple.quarantine third_party/curl/macos-arm64/curl`，必要时再 `codesign -s - --force`。重新签名会改变字节，需要同时改 `PIN.txt` 和 `hfmd/curlsafe.py` 里的 SHA256，两者必须一致。
 
 目标：让同一份 Python 程序在 Apple 芯片的 Mac 上直连 hf-mirror。代理隔离、分片、总带宽上限和断点续传保持现在的行为。Windows x64 继续使用已经钉死的 curl 8.23.0_9。
-
-执行者：在 Mac 上拉取本分支 `dev/macos-arm64`，按本文实现、测试，再推回这个分支。不要合并到 `master`。
 
 ## 范围
 
@@ -62,7 +67,7 @@ third_party/curl/macos-arm64/curl binary
 https://curl.se/download/curl-8.23.0.tar.xz
 ```
 
-curl.se 不提供和 Windows 那份对应的官方 Mac 二进制。Mac 上的这一份必须在 Apple 芯片的 Mac 上从上述源码编出来。不要拿 Homebrew、MacPorts、conda-forge 或 `/usr/bin/curl` 来充数，即使它们的版本号也是 8.23.0。
+curl.se 不提供和 Windows 那份对应的官方 Mac 二进制。本分支已经放好交叉编译的 `third_party/curl/macos-arm64/curl`，请直接测这份文件。不要拿 Homebrew、MacPorts、conda-forge 或 `/usr/bin/curl` 替换它，即使它们的版本号也是 8.23.0。
 
 ### 校验源码
 
@@ -74,7 +79,7 @@ curl.se 不提供和 Windows 那份对应的官方 Mac 二进制。Mac 上的这
 
 编译时的 `PATH` 只用 `/usr/bin:/bin:/usr/sbin`，避免 `pkg-config` 或 Homebrew 把头文件和库指到 `/opt/homebrew`。
 
-TLS 使用 Apple Secure Transport，这样信任系统钥匙串，作用对应 Windows 构建上的 NativeCA。不要改用 LibreSSL 或 OpenSSL，也不要在仓库里再放一份 `cacert.pem`。
+curl 8.15.0 起已经去掉 Secure Transport，所以这份构建静态链接 LibreSSL 4.4.1，并用 `--with-apple-sectrust` 走系统钥匙串。不要改回 `--with-secure-transport`，那个选项在 8.23 上配不出来。不要在仓库里再放一份 `cacert.pem`。
 
 在源码树里配置（不要把本机的绝对路径写进 `BUILD.txt`，只记录这些选项）：
 
@@ -82,8 +87,8 @@ TLS 使用 Apple Secure Transport，这样信任系统钥匙串，作用对应 W
 ./configure \
   --disable-shared \
   --enable-static \
-  --with-secure-transport \
-  --without-openssl \
+  --with-openssl=/opt/hfmd/libressl \
+  --with-apple-sectrust \
   --without-gnutls \
   --without-mbedtls \
   --without-wolfssl \
@@ -105,11 +110,11 @@ TLS 使用 Apple Secure Transport，这样信任系统钥匙串，作用对应 W
   --disable-manual
 ```
 
-不要加 `--without-ssl`。那个开关会把 TLS 整个关掉，和 `--with-secure-transport` 冲突。
+不要加 `--without-ssl`。那个开关会把 TLS 整个关掉。
 
 当前下载不发送 `--compressed`，所以可以不链 zlib。HTTP/2 和 HTTP/3 也不要打开。连接复用靠 HTTP/1.1 的 `--next`，单元测试里的本地服务只说 HTTP/1.1。
 
-`config.log` 里 TLS 后端应是 Secure Transport。若配置阶段改去链接 `/opt/homebrew` 或 `/usr/local` 里的库，停下来查原因，不要继续安装那些动态库。
+`config.log` 里应能看到 OpenSSL（指向静态 LibreSSL）和 Apple SecTrust。若配置阶段改去链接 `/opt/homebrew` 或 `/usr/local` 里的库，停下来查原因，不要继续安装那些动态库。
 
 ### 产物
 
@@ -127,7 +132,7 @@ src/curl -q -V
 
 - `file` 显示 Mach-O 64-bit executable arm64。
 - `otool -L` 只出现系统库：`/usr/lib/libSystem.B.dylib`，以及 `Security`、`CoreFoundation`、`CFNetwork` 这类系统框架。不能出现 `/opt/homebrew`、`/usr/local`、`@rpath` 下的第三方 dylib，也不能出现另一份 `libcurl`。
-- `curl -q -V` 的第一行以 `curl 8.23.0 ` 开头，输出里能看到 SecureTransport。
+- `curl -q -V` 的第一行以 `curl 8.23.0 ` 开头，输出里能看到 `LibreSSL/4.4.1` 和 `AppleSecTrust`。不要期待 `SecureTransport`。
 - 若做不到「除系统库外不再依赖动态库」，停止并在提交说明里写明卡在哪一个库。不要把 Homebrew 的 dylib 放进仓库。
 
 把签名后的文件复制为 `third_party/curl/macos-arm64/curl`，并 `chmod 755`。用 `git update-index --chmod=+x` 保证文件模式进库。
@@ -137,7 +142,7 @@ src/curl -q -V
 ```text
 version=8.23.0
 arch=arm64
-tls=secure-transport
+tls=libressl-4.4.1+apple-sectrust
 source=https://curl.se/download/curl-8.23.0.tar.xz
 source_sha256=<源码包的 SHA256>
 curl_sha256=<签名之后的可执行文件 SHA256>
@@ -157,7 +162,7 @@ curl_sha256=<签名之后的可执行文件 SHA256>
 - `darwin` 且 `arm64`：`third_party/curl/macos-arm64/curl`。只核对这一个文件，哈希常量与 Mac 的 `PIN.txt` 里 `curl_sha256` 相同。版本检查仍然只要求第一行以 `curl 8.23.0 ` 开头。
 - 其它平台，包括 Intel Mac：`verify_bundled_curl()` 和 `curl_exe()` 抛出 `CurlError`，说明当前只提供 Windows x64 和 Apple 芯片。缺少文件或哈希不符也拒绝运行，提示不能改用系统 curl。
 
-Windows 测试不要求 Mac 文件存在。Mac 哈希常量只在 darwin 分支使用。不要在 Windows 路径上打开 `macos-arm64/curl`。
+哈希常量在所有平台上都必须和 `PIN.txt`、文件字节一致。Windows 只读这个文件的字节和 Mach-O 头，不执行它。运行时只有 darwin arm64 会启动它。
 
 `child_env()`：
 

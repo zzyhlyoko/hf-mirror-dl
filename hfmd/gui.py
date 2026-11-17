@@ -2,12 +2,13 @@
 
 from __future__ import annotations
 
+import sys
 import threading
 import tkinter as tk
 from pathlib import Path
 from tkinter import filedialog, ttk
 
-from hfmd.curlsafe import PINNED_BUILD, Cancelled, kill_all
+from hfmd.curlsafe import bundled_curl_label, Cancelled, kill_all
 from hfmd.download import DownloadError, Progress, download_model
 
 
@@ -29,7 +30,10 @@ class App:
         style = ttk.Style()
         if "vista" in style.theme_names():
             style.theme_use("vista")
-        self.font = ("Microsoft YaHei UI", 10)
+        if sys.platform == "darwin":
+            self.font = ("PingFang SC", 13)
+        else:
+            self.font = ("Microsoft YaHei UI", 10)
         root.option_add("*Font", self.font)
 
         frame = ttk.Frame(root, padding=12)
@@ -57,7 +61,7 @@ class App:
         hint = ttk.Label(
             frame,
             text=(
-                f"直连 hf-mirror，使用内置 curl {PINNED_BUILD}。"
+                f"直连 hf-mirror，使用内置 curl {bundled_curl_label()}。"
                 "不读取系统代理、环境变量代理或 curlrc。"
                 "带宽单位是 Mbps（兆比特/秒），300 Mbps 大约是 37.5 MB/s。"
                 "文件保存到 目录/provider/model_name。"

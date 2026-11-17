@@ -21,6 +21,8 @@ download_home/provider/model_name/
 
 启动时会核对这两个文件的 SHA256，不一致就拒绝运行。不要改成系统 curl，也不要删掉旁边的 DLL。
 
+Apple 芯片的 Mac 使用另一份同样版本的 curl，放在 `third_party/curl/macos-arm64/curl`。它在 MacOSX 15.5 SDK 上静态编译。curl 8.15 起已经去掉 Secure Transport，所以这份构建静态链接 LibreSSL 4.4.1（与 Windows 上那份官方 curl 相同），证书校验使用系统钥匙串（Apple SecTrust）。启动时同样核对 SHA256。Intel Mac 和 Rosetta 下的 Python 会直接拒绝运行。不要改用系统里的 curl。
+
 每次调用都同时做这几件事：
 
 1. 第一个参数是 `-q`，不读 curlrc。
@@ -42,8 +44,16 @@ hf-mirror 的 CDN 对单条连接很慢，所以要靠很多条连接叠速度�
 
 ## 图形界面
 
+Windows：
+
 ```bat
 hfmd-gui.bat
+```
+
+Apple 芯片的 Mac：
+
+```sh
+./hfmd-gui.command
 ```
 
 或：
@@ -51,6 +61,8 @@ hfmd-gui.bat
 ```bat
 python -m hfmd gui
 ```
+
+Mac 上的图形界面需要带 Tk 的 Python 3.11 或更新版本。python.org 提供的 macOS 安装包带 Tk。没有 Tk 时，命令行仍然可用。
 
 填写模型名（`provider/model_name`）、并发数、总带宽和保存目录。Token 和修订版本可以留空。
 
@@ -60,6 +72,12 @@ python -m hfmd gui
 
 ```bat
 python -m hfmd download Qwen/Qwen2.5-7B-Instruct -c 32 -b 300 -d D:\models
+```
+
+Apple 芯片的 Mac：
+
+```sh
+python3 -m hfmd download Qwen/Qwen2.5-7B-Instruct -c 32 -b 300 -d ~/models
 ```
 
 参数：
@@ -89,6 +107,8 @@ done path=D:\models\Qwen\Qwen2.5-7B-Instruct
 ```bat
 python -m unittest discover -s tests
 ```
+
+Apple 芯片的 Mac 上把 `python` 换成 `python3`。
 
 测试在本机起一个假的镜像和一个会记录连接的代理，确认代理连接数是 0，并检查总带宽没有明显超过设定值。
 

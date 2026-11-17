@@ -1,29 +1,32 @@
 """The only place this program is allowed to touch the network.
 
-Do not replace this with urllib, requests, httpx, the Windows copy of curl,
+Do not replace this with urllib, requests, httpx, the operating system's curl,
 or a curl found on PATH. Those pick up HTTP_PROXY, curlrc, or the system
 proxy. hf-mirror rejects proxied downloads, and a proxy would also bill the
 traffic.
 
 Every transfer uses the curl 8.23.0 build shipped in third_party/curl.
-The child process gets an allowlisted environment with no proxy variables,
-and the argument list always starts with:
+Windows uses curl.exe plus libcurl-x64.dll. Apple silicon uses
+third_party/curl/macos-arm64/curl. The child process gets an allowlisted
+environment with no proxy variables, and the argument list always starts with:
 
-    curl.exe -q --noproxy * --proxy <empty> --proto ... --proto-redir ...
+    <bundled curl> -q --noproxy * --proxy <empty> --proto ... --proto-redir ...
 
 -q is first so curl does not read _curlrc or .curlrc.
 --noproxy * turns proxy use off for every host.
 --proxy "" overrides a proxy that was still configured.
 The environment allowlist means the child cannot see HTTP(S)_PROXY,
-ALL_PROXY, CURL_HOME, or the user profile that would hold a curlrc.
+ALL_PROXY, CURL_HOME, or a home directory that would hold a curlrc.
 """
 
 from __future__ import annotations
 
 import hashlib
 import os
+import platform
 import queue
 import subprocess
+import sys
 import threading
 import time
 from dataclasses import dataclass
@@ -34,8 +37,17 @@ from hfmd.limiter import BandwidthLimiter
 
 PINNED_VERSION = "8.23.0"
 PINNED_BUILD = "8.23.0_9"
+MACOS_ARM64_BUILD = "8.23.0-macos-arm64"
+# SHA256 of third_party/curl/macos-arm64/curl, including its linker signature.
+_MACOS_ARM64_SHA256 = "a9a9a678ac276b6232dbbe0eac0e981d98082dd6fdddd16f77a1ed1205e898c9"
 _CURL_SHA256 = "3c871d76f592b7b2050c6070a293d296c9fd67a0b3d165b2fa4cd7d7e4a02f58"
 _DLL_SHA256 = "097a9d6f0b204deacf3953c43376bde1d012762c9798c238c69f60b006e44965"
+_SCUTIL_ENABLE = frozenset({
+    "HTTPEnable",
+    "HTTPSEnable",
+    "SOCKSEnable",
+    "ProxyAutoConfigEnable",
+})
 _READ_SIZE = 64 * 1024
 _ENV_ALLOW = {
     "SYSTEMROOT",
@@ -107,13 +119,28 @@ def curl_dir() -> Path:
     return _CURL_DIR
 
 
+def bundled_curl_label() -> str:
+    """Build id shown to people. Windows keeps the official 8.23.0_9 id."""
+    if sys.platform == "darwin" and platform.machine() == "arm64":
+        return MACOS_ARM64_BUILD
+    return PINNED_BUILD
+
+
 def curl_exe() -> Path:
-    return _CURL_DIR / "curl.exe"
+    if _platform_kind() == "win32":
+        return _CURL_DIR / "curl.exe"
+    return _CURL_DIR / "macos-arm64" / "curl"
 
 
 def child_env() -> dict[str, str]:
     """Environment for a curl child. Proxy variables are not copied, even if set."""
-    source = {key.upper(): value for key, value in os.environ.items()}
+    if _platform_kind() == "win32":
+        source = {key.upper(): value for key, value in os.environ.items()}
+        return _windows_child_env(source)
+    return _macos_child_env()
+
+
+def _windows_child_env(source: dict[str, str]) -> dict[str, str]:
     env: dict[str, str] = {}
     for name in _ENV_ALLOW:
         if name in source and source[name]:
@@ -126,6 +153,19 @@ def child_env() -> dict[str, str]:
     # Only Windows itself. The user PATH can contain another curl or a proxy tool.
     env["PATH"] = str(Path(system_root) / "System32") + os.pathsep + system_root
     return env
+
+
+def _macos_child_env() -> dict[str, str]:
+    # Fixed values. The parent TMPDIR often sits in a per-user directory.
+    return {"PATH": "/usr/bin:/bin", "TMPDIR": "/tmp"}
+
+
+def _platform_kind() -> str:
+    if sys.platform == "win32":
+        return "win32"
+    if sys.platform == "darwin" and platform.machine() == "arm64":
+        return "macos-arm64"
+    raise CurlError("当前只提供 Windows x64 和 Apple 芯片（arm64）的内置 curl。")
 
 
 def command_prefix(*, allow_loopback_http: bool = False) -> list[str]:
@@ -151,15 +191,29 @@ def verify_bundled_curl() -> str:
     with _verify_lock:
         if _verified:
             return f"curl {PINNED_VERSION}"
+        kind = _platform_kind()
         exe = curl_exe()
-        dll = _CURL_DIR / "libcurl-x64.dll"
-        if not exe.is_file() or not dll.is_file():
-            raise CurlError(
-                "内置 curl 不完整。需要 third_party/curl/curl.exe 和同目录的 libcurl-x64.dll，"
-                "不能改用系统里的 curl。"
-            )
-        _check_hash(exe, _CURL_SHA256)
-        _check_hash(dll, _DLL_SHA256)
+        if kind == "win32":
+            dll = _CURL_DIR / "libcurl-x64.dll"
+            if not exe.is_file() or not dll.is_file():
+                raise CurlError(
+                    "内置 curl 不完整。需要 third_party/curl/curl.exe 和同目录的 libcurl-x64.dll，"
+                    "不能改用系统里的 curl。"
+                )
+            _check_hash(exe, _CURL_SHA256, PINNED_BUILD)
+            _check_hash(dll, _DLL_SHA256, PINNED_BUILD)
+        else:
+            if not _MACOS_ARM64_SHA256:
+                raise CurlError(
+                    "Apple 芯片的内置 curl 还没有登记 SHA256。"
+                    "需要 third_party/curl/macos-arm64/curl，不能改用系统里的 curl。"
+                )
+            if not exe.is_file():
+                raise CurlError(
+                    "内置 curl 不完整。需要 third_party/curl/macos-arm64/curl，"
+                    "不能改用系统里的 curl。"
+                )
+            _check_hash(exe, _MACOS_ARM64_SHA256, MACOS_ARM64_BUILD)
         proc = subprocess.run(
             [str(exe), "-q", "-V"],
             capture_output=True,
@@ -419,7 +473,26 @@ def check_initial_url(url: str, *, allow_loopback_http: bool) -> None:
 
 
 def system_proxy_enabled() -> bool:
-    """True when Windows has a proxy turned on. The value itself is not read."""
+    """True when a system proxy switch is on. The address itself is not read."""
+    if sys.platform == "win32":
+        return _windows_proxy_enabled()
+    if sys.platform == "darwin":
+        return _macos_proxy_enabled()
+    return False
+
+
+def proxy_enabled_from_scutil_text(text: str) -> bool:
+    """Read only Enable flags from `scutil --proxy`. Never return a proxy address."""
+    for line in text.splitlines():
+        if ":" not in line:
+            continue
+        name, value = line.split(":", 1)
+        if name.strip() in _SCUTIL_ENABLE and value.strip() == "1":
+            return True
+    return False
+
+
+def _windows_proxy_enabled() -> bool:
     try:
         import winreg
     except ImportError:
@@ -435,10 +508,27 @@ def system_proxy_enabled() -> bool:
     return int(value) == 1
 
 
-def _check_hash(path: Path, expected: str) -> None:
+def _macos_proxy_enabled() -> bool:
+    try:
+        proc = subprocess.run(
+            ["/usr/sbin/scutil", "--proxy"],
+            capture_output=True,
+            env=child_env(),
+            creationflags=_creation_flags(),
+            check=False,
+            timeout=5,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    if proc.returncode != 0:
+        return False
+    return proxy_enabled_from_scutil_text(proc.stdout.decode("utf-8", "replace"))
+
+
+def _check_hash(path: Path, expected: str, build: str) -> None:
     digest = hashlib.sha256(path.read_bytes()).hexdigest()
     if digest != expected:
-        raise CurlError(f"{path.name} 的 SHA256 与内置的 {PINNED_BUILD} 不一致，拒绝运行")
+        raise CurlError(f"{path.name} 的 SHA256 与内置的 {build} 不一致，拒绝运行")
 
 
 def _creation_flags() -> int:

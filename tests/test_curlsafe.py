@@ -1,7 +1,9 @@
 import ast
+import hashlib
 import os
 import shutil
 import socket
+import sys
 import threading
 import time
 import unittest
@@ -9,9 +11,12 @@ from pathlib import Path
 
 from hfmd.curlsafe import (
     PINNED_VERSION,
+    _MACOS_ARM64_SHA256,
+    _macos_child_env,
     child_env,
     command_prefix,
     curl_exe,
+    proxy_enabled_from_scutil_text,
     verify_bundled_curl,
 )
 from hfmd.limiter import BandwidthLimiter
@@ -36,6 +41,9 @@ class BundledCurlTests(unittest.TestCase):
             os.environ["ALL_PROXY"] = "socks5h://127.0.0.1:9"
             os.environ["CURL_HOME"] = r"C:\proxy-config"
             os.environ["USERPROFILE"] = r"C:\not-a-profile"
+            os.environ["HOME"] = "/tmp/not-a-home"
+            os.environ["DYLD_LIBRARY_PATH"] = "/tmp/injected"
+            os.environ["DYLD_INSERT_LIBRARIES"] = "/tmp/injected.dylib"
             env = child_env()
         finally:
             os.environ.clear()
@@ -45,7 +53,55 @@ class BundledCurlTests(unittest.TestCase):
         self.assertNotIn("curl_home", lowered)
         self.assertNotIn("userprofile", lowered)
         self.assertNotIn("appdata", lowered)
-        self.assertIn("SYSTEMROOT", {key.upper() for key in env})
+        self.assertNotIn("home", lowered)
+        self.assertNotIn("dyld_library_path", lowered)
+        self.assertNotIn("dyld_insert_libraries", lowered)
+        if sys.platform == "win32":
+            self.assertIn("SYSTEMROOT", {key.upper() for key in env})
+        elif sys.platform == "darwin":
+            self.assertEqual(env, {"PATH": "/usr/bin:/bin", "TMPDIR": "/tmp"})
+
+    def test_macos_child_env_is_fixed(self) -> None:
+        self.assertEqual(_macos_child_env(), {"PATH": "/usr/bin:/bin", "TMPDIR": "/tmp"})
+
+    def test_scutil_parser_reads_enable_flags_only(self) -> None:
+        sample = "  HTTPEnable : 1\n  HTTPProxy : 192.0.2.1\n  HTTPPort : 9\n"
+        try:
+            enabled = proxy_enabled_from_scutil_text(sample)
+        except Exception as exc:
+            self.fail(f"parser raised and the message was {exc}")
+        self.assertIs(enabled, True)
+        self.assertNotIn("192.0.2.1", repr(enabled))
+        off = "\n".join(
+            f"  {name} : 0"
+            for name in (
+                "HTTPEnable",
+                "HTTPSEnable",
+                "SOCKSEnable",
+                "ProxyAutoConfigEnable",
+            )
+        )
+        self.assertIs(proxy_enabled_from_scutil_text(off), False)
+        self.assertIs(
+            proxy_enabled_from_scutil_text("  HTTPProxy : 192.0.2.1\n  HTTPEnable : 0\n"),
+            False,
+        )
+
+    def test_macos_arm64_binary_matches_pin(self) -> None:
+        binary = ROOT / "third_party" / "curl" / "macos-arm64" / "curl"
+        pin_text = (ROOT / "third_party" / "curl" / "macos-arm64" / "PIN.txt").read_text(
+            encoding="utf-8"
+        )
+        self.assertTrue(_MACOS_ARM64_SHA256)
+        self.assertIn(f"curl_sha256={_MACOS_ARM64_SHA256}", pin_text)
+        data = binary.read_bytes()
+        self.assertEqual(hashlib.sha256(data).hexdigest(), _MACOS_ARM64_SHA256)
+        magic = int.from_bytes(data[:4], "little")
+        cputype = int.from_bytes(data[4:8], "little")
+        self.assertEqual(magic, 0xFEEDFACF)
+        self.assertEqual(cputype, 0x0100000C)
+        self.assertNotIn(b"/opt/homebrew", data)
+        self.assertNotIn(b"/usr/local/", data)
 
     def test_piece_command_keeps_proxy_off_and_has_no_per_connection_cap(self) -> None:
         from hfmd.curlsafe import Piece, piece_command
@@ -82,6 +138,8 @@ class BundledCurlTests(unittest.TestCase):
             "System32\\curl",
             "System32/curl",
             "shutil.which",
+            "/usr/bin/curl",
+            "/opt/homebrew",
         )
         for path in (ROOT / "hfmd").rglob("*.py"):
             text = path.read_text(encoding="utf-8")

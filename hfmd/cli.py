@@ -8,7 +8,7 @@ import sys
 from pathlib import Path
 
 from hfmd import __version__
-from hfmd.curlsafe import PINNED_BUILD, Cancelled
+from hfmd.curlsafe import bundled_curl_label, Cancelled
 from hfmd.download import DownloadError, Progress, download_model
 
 
@@ -40,7 +40,11 @@ def _parser() -> argparse.ArgumentParser:
         prog="hfmd",
         description="直连 hf-mirror 下载模型。内置固定版本的 curl，不走系统代理和环境变量代理。",
     )
-    parser.add_argument("--version", action="version", version=f"hfmd {__version__} (curl {PINNED_BUILD})")
+    parser.add_argument(
+        "--version",
+        action="version",
+        version=f"hfmd {__version__} (curl {bundled_curl_label()})",
+    )
     sub = parser.add_subparsers(dest="cmd")
 
     gui = sub.add_parser("gui", help="打开图形界面")

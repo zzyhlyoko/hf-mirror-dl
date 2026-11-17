@@ -1,0 +1,49 @@
+curl 8.23.0 for Apple silicon, statically linked with LibreSSL 4.4.1.
+
+source=https://curl.se/download/curl-8.23.0.tar.xz
+source_sha256=8dadd7d2536a314f982ad05a651b713f426bf7d02cc2c76cffb9796f2218e6c5
+libressl_source=https://github.com/libressl/portable/releases/download/v4.4.1/libressl-4.4.1.tar.gz
+libressl_sha256=290cdf1b53c086255dc302f118b98602a444e9ae6d11e9bfdd8c9b1b60aa3a22
+
+Secure Transport was removed from curl in 8.15.0, so this build does not use it.
+LibreSSL is configured with a generic prefix, static only:
+
+  --host=aarch64-apple-darwin24.5
+  --build=x86_64-pc-linux-gnu
+  --prefix=/opt/hfmd/libressl
+  --disable-shared
+  --enable-static
+
+curl is configured with:
+
+  --host=aarch64-apple-darwin24.5
+  --build=x86_64-pc-linux-gnu
+  --disable-shared
+  --enable-static
+  --with-openssl=/opt/hfmd/libressl
+  --with-apple-sectrust
+  --without-gnutls
+  --without-mbedtls
+  --without-wolfssl
+  --without-rustls
+  --without-amissl
+  --without-zlib
+  --without-brotli
+  --without-zstd
+  --without-libpsl
+  --without-libssh2
+  --without-nghttp2
+  --without-nghttp3
+  --without-ngtcp2
+  --without-libidn2
+  --without-ca-bundle
+  --without-ca-path
+  --disable-ldap
+  --disable-ldaps
+  --disable-manual
+
+Compiler target aarch64-apple-darwin24.5, minimum OS 11.0, SDK MacOSX15.5.
+Linker ld64.lld 14. The link writes LC_CODE_SIGNATURE. The SHA256 in PIN.txt
+is of those final bytes. Do not replace this file with a Homebrew or system curl.
+Dynamic libraries are only libSystem and the Security, CoreFoundation,
+CoreServices, and SystemConfiguration frameworks.

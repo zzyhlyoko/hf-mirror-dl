@@ -1,0 +1,8 @@
+version=8.23.0
+arch=arm64
+tls=libressl-4.4.1+apple-sectrust
+source=https://curl.se/download/curl-8.23.0.tar.xz
+source_sha256=8dadd7d2536a314f982ad05a651b713f426bf7d02cc2c76cffb9796f2218e6c5
+libressl_source=https://github.com/libressl/portable/releases/download/v4.4.1/libressl-4.4.1.tar.gz
+libressl_sha256=290cdf1b53c086255dc302f118b98602a444e9ae6d11e9bfdd8c9b1b60aa3a22
+curl_sha256=a9a9a678ac276b6232dbbe0eac0e981d98082dd6fdddd16f77a1ed1205e898c9
