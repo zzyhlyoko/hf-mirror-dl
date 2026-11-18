@@ -11,12 +11,15 @@ from pathlib import Path
 
 from hfmd.curlsafe import (
     PINNED_VERSION,
+    CurlError,
     _MACOS_ARM64_SHA256,
     _macos_child_env,
     child_env,
     command_prefix,
     curl_exe,
+    is_public_ip,
     proxy_enabled_from_scutil_text,
+    safe_redirect,
     verify_bundled_curl,
 )
 from hfmd.limiter import BandwidthLimiter
@@ -122,6 +125,53 @@ class BundledCurlTests(unittest.TestCase):
         self.assertGreaterEqual(cmd.count("--noproxy"), 2)
         self.assertGreaterEqual(cmd.count("--proxy"), 2)
         self.assertNotIn("--retry", cmd)
+        self.assertNotIn("--location", cmd)
+
+    def test_token_stays_on_the_mirror_host(self) -> None:
+        from hfmd.curlsafe import Piece, piece_command
+
+        mirror = piece_command(
+            [Piece("https://hf-mirror.com/acme/tiny/resolve/main/a.bin", 0, 1, 1, Path("a.bin"), 0)],
+            allow_loopback_http=False,
+            header_paths=[Path("h0.txt")],
+            token="secret-token",
+        )
+        cdn = piece_command(
+            [Piece("https://cas-bridge.xethub.hf.co/object", 0, 1, 1, Path("a.bin"), 0)],
+            allow_loopback_http=False,
+            header_paths=[Path("h0.txt")],
+            token="secret-token",
+        )
+        self.assertIn("Authorization: Bearer secret-token", mirror)
+        self.assertNotIn("secret-token", cdn)
+
+    def test_peer_and_redirect_rules(self) -> None:
+        self.assertTrue(is_public_ip("8.8.8.8", allow_loopback=False))
+        self.assertFalse(is_public_ip("127.0.0.1", allow_loopback=False))
+        self.assertTrue(is_public_ip("127.0.0.1", allow_loopback=True))
+        self.assertFalse(is_public_ip("10.1.2.3", allow_loopback=False))
+        self.assertFalse(is_public_ip("192.168.0.1", allow_loopback=False))
+        self.assertFalse(is_public_ip("100.64.1.1", allow_loopback=False))
+        rewritten = safe_redirect(
+            "https://hf-mirror.com/acme/tiny/resolve/main/a.bin",
+            "https://huggingface.co/acme/tiny/resolve/main/a.bin?token=hidden",
+            allow_loopback=False,
+        )
+        self.assertEqual(rewritten, "https://hf-mirror.com/acme/tiny/resolve/main/a.bin?token=hidden")
+        kept = safe_redirect(
+            "https://hf-mirror.com/acme/tiny/resolve/main/a.bin",
+            "https://cas-bridge.xethub.hf.co/object",
+            allow_loopback=False,
+        )
+        self.assertTrue(kept.startswith("https://cas-bridge.xethub.hf.co/"))
+        with self.assertRaises(CurlError) as caught:
+            safe_redirect(
+                "https://hf-mirror.com/acme/tiny/resolve/main/a.bin",
+                "https://evil.example/secret-path?sig=abc",
+                allow_loopback=False,
+            )
+        self.assertNotIn("secret-path", str(caught.exception))
+        self.assertNotIn("sig=", str(caught.exception))
 
     def test_bundled_binary_reports_pinned_version(self) -> None:
         line = verify_bundled_curl()

@@ -9,6 +9,7 @@ import os
 import queue
 import re
 import shutil
+import tempfile
 import threading
 import time
 from collections import deque
@@ -23,10 +24,13 @@ from hfmd.curlsafe import (
     Piece,
     PieceFailed,
     RangeIgnored,
+    RateLimited,
+    RedirectRequired,
     SlowTransfer,
     download_pieces,
     get_bytes,
     kill_all,
+    probe_peer,
     system_proxy_enabled,
     verify_bundled_curl,
 )
@@ -36,8 +40,9 @@ ENDPOINT = "https://hf-mirror.com"
 _MODEL_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,96}/[A-Za-z0-9][A-Za-z0-9._-]{0,96}$")
 _REVISION_RE = re.compile(r"[A-Za-z0-9._-]{1,128}")
 _MIN_CHUNK = 4 * 1024 * 1024
-_MAX_CHUNK = 128 * 1024 * 1024
+_MAX_CHUNK = 32 * 1024 * 1024
 _BATCH = 4
+_TAIL_PARTS = 8
 _SLOW_TRIES = 2
 _INITIAL_WORKERS = 8
 _MAX_CONCURRENCY = 128
@@ -60,6 +65,8 @@ class _Task:
     start: int
     end: int
     tries: int = 0
+    url: str | None = None
+    hops: int = 0
 
 
 @dataclass
@@ -123,6 +130,10 @@ def download_model(
     if token is not None:
         token = token.strip() or None
     endpoint = _check_endpoint(endpoint, allow_loopback_http)
+    try:
+        probe_peer(f"{endpoint}/", allow_loopback_http=allow_loopback_http)
+    except CurlError as exc:
+        raise DownloadError(str(exc)) from exc
     dest = destination_for(download_home, f"{provider}/{name}")
     dest.mkdir(parents=True, exist_ok=True)
     meta_dir = dest / ".hfmd"
@@ -165,6 +176,8 @@ def download_model(
     limiter = BandwidthLimiter(bandwidth_mbps * 1_000_000)
     tasks = [task for task in _plan(files, concurrency, state) if not _task_done(state, task)]
     file_locks = {item.path: threading.Lock() for item in files}
+    generations = {item.path: 0 for item in files}
+    ramp_hold = [0.0]
     ignored: set[str] = set()
     errors: list[BaseException] = []
     lock = threading.Lock()
@@ -203,14 +216,19 @@ def download_model(
     def give_up(seen: int, elapsed: float) -> bool:
         if elapsed < 15 or seen < 0:
             return False
+        speed = seen / elapsed
         key = threading.get_ident()
-        pace.publish(key, seen / elapsed)
+        pace.publish(key, speed)
         peers, median = pace.median_others(key)
         if peers < 2 or median < 250_000:
+            # The last links used to be exempt. Split them when idle workers
+            # are waiting and this link is far below the shared cap.
+            if peers < 2 and waiting_workers[0] >= 1 and speed < bandwidth_mbps * 125_000 * 0.5:
+                return True
             return False
         if seen < 128 * 1024:
             return True
-        return peers >= 4 and seen / elapsed < median * 0.25
+        return peers >= 4 and speed < median * 0.25
 
     def run_batch(batch: list[_Task]) -> None:
         pending = [task for task in batch if usable(task)]
@@ -241,6 +259,8 @@ def download_model(
                     state_path=state_path,
                     state_lock=lock,
                     file_locks=file_locks,
+                    generations=generations,
+                    parts=parts,
                     meter=meter,
                     on_progress=emit_progress,
                     give_up=give_up if allow_slow_kill else None,
@@ -248,19 +268,41 @@ def download_model(
                 return
             except SlowTransfer as exc:
                 meter.drop(exc.written)
-                for task in pending[exc.index :]:
-                    work.put(_Task(task.file, task.start, task.end, task.tries + 1))
+                failed = pending[exc.index]
+                for part in _split_task(failed, _TAIL_PARTS, failed.tries + 1):
+                    work.put(part)
+                for task in pending[exc.index + 1 :]:
+                    work.put(task)
                 return
             except RangeIgnored as exc:
                 meter.drop(exc.written)
                 failed = pending[min(exc.index, len(pending) - 1)]
-                with lock:
-                    if failed.file.path not in ignored:
-                        ignored.add(failed.file.path)
-                        _reset_file(dest, failed.file, state)
-                        _save_state(state_path, state)
-                        work.put(_Task(failed.file, 0, failed.file.size))
+                with file_locks[failed.file.path]:
+                    generations[failed.file.path] += 1
+                    with lock:
+                        if failed.file.path not in ignored:
+                            ignored.add(failed.file.path)
+                            _reset_file(dest, failed.file, state)
+                            _save_state(state_path, state)
+                            work.put(_Task(failed.file, 0, failed.file.size))
                 return
+            except RedirectRequired as exc:
+                meter.drop(exc.written)
+                failed = pending[min(exc.index, len(pending) - 1)]
+                if failed.hops >= 5:
+                    raise DownloadError("跳转次数过多，已停止") from exc
+                work.put(_Task(failed.file, failed.start, failed.end, failed.tries, exc.next_url, failed.hops + 1))
+                for task in pending[exc.index + 1 :]:
+                    work.put(task)
+                return
+            except RateLimited as exc:
+                meter.drop(exc.written)
+                wait = exc.retry_after
+                ramp_hold[0] = time.monotonic() + wait
+                time.sleep(wait)
+                if attempt == 4:
+                    raise DownloadError("镜像限流，多次重试后仍失败") from exc
+                continue
             except PieceFailed as exc:
                 meter.drop(exc.written)
                 pending = pending[exc.index :]
@@ -279,13 +321,31 @@ def download_model(
     def worker() -> None:
         gate.acquire()
         while True:
+            with idle_lock:
+                waiting_workers[0] += 1
             task = work.get()
+            with idle_lock:
+                waiting_workers[0] -= 1
             if task is None:
                 work.task_done()
                 return
+            # A shallow queue means some workers are about to go idle. Split
+            # this piece so they can share the tail instead of waiting on it.
+            split_tail = False
+            if work.qsize() < opened_workers[0]:
+                pieces = _split_task(task, min(_TAIL_PARTS, opened_workers[0]), task.tries)
+                split_tail = len(pieces) > 1
+                task = pieces[0]
+                for extra in pieces[1:]:
+                    work.put(extra)
             batch = [task]
             try:
-                while len(batch) < _BATCH and batch[0].tries < _SLOW_TRIES:
+                while (
+                    not split_tail
+                    and len(batch) < _BATCH
+                    and batch[0].tries < _SLOW_TRIES
+                    and work.qsize() >= opened_workers[0]
+                ):
                     try:
                         extra = work.get_nowait()
                     except queue.Empty:
@@ -324,6 +384,9 @@ def download_model(
         for thread in threads:
             thread.start()
         initial = min(_INITIAL_WORKERS, count)
+        opened_workers = [initial]
+        waiting_workers = [0]
+        idle_lock = threading.Lock()
 
         def grow() -> None:
             opened = initial
@@ -331,6 +394,8 @@ def download_model(
                 if finished.wait(6):
                     return
                 if cancel.is_set() or errors or work.empty():
+                    continue
+                if time.monotonic() < ramp_hold[0]:
                     continue
                 if meter.speed_mbps() >= bandwidth_mbps * 0.8:
                     continue
@@ -340,6 +405,7 @@ def download_model(
                 for _permit in range(step):
                     gate.release()
                 opened += step
+                opened_workers[0] = opened
 
         for _permit in range(initial):
             gate.release()
@@ -545,6 +611,24 @@ def _safe_rel(path: str) -> str:
     return "/".join(parts)
 
 
+def _split_task(task: _Task, parts: int, tries: int) -> list[_Task]:
+    """Divide one range so idle workers can download the tail in parallel."""
+    span = task.end - task.start
+    parts = max(1, parts)
+    if span <= 0 or parts == 1:
+        return [_Task(task.file, task.start, task.end, tries, task.url, task.hops)]
+    chunk = max(_MIN_CHUNK, math.ceil(span / parts))
+    if chunk >= span:
+        return [_Task(task.file, task.start, task.end, tries, task.url, task.hops)]
+    pieces: list[_Task] = []
+    start = task.start
+    while start < task.end:
+        end = min(task.end, start + chunk)
+        pieces.append(_Task(task.file, start, end, tries, task.url, task.hops))
+        start = end
+    return pieces
+
+
 def _plan(files: list[RemoteFile], concurrency: int, state: dict) -> list[_Task]:
     tasks: list[_Task] = []
     saved = state.get("files") or {}
@@ -703,48 +787,77 @@ def _transfer_batch(
     state_path: Path,
     state_lock: threading.Lock,
     file_locks: dict[str, threading.Lock],
+    generations: dict[str, int],
+    parts: Path,
     meter: _Meter,
     on_progress: Callable[[str], None],
     give_up: Callable[[int, float], bool] | None,
 ) -> None:
     pieces: list[Piece] = []
+    captured: list[int] = []
+    temps: list[Path] = []
+    parts.mkdir(parents=True, exist_ok=True)
     for task in tasks:
-        target = _ensure_size(dest, task, file_locks[task.file.path])
-        url = (
+        _ensure_size(dest, task, file_locks[task.file.path])
+        with file_locks[task.file.path]:
+            captured.append(generations[task.file.path])
+        url = task.url or (
             f"{endpoint}/{_repo_path(state['model'])}/resolve/"
             f"{quote(revision, safe='')}/{quote(task.file.path, safe='/')}"
         )
-        pieces.append(Piece(url, task.start, task.end, task.file.size, target, task.start))
+        handle, name = tempfile.mkstemp(prefix="hfmd-piece-", dir=parts)
+        os.close(handle)
+        temp = Path(name)
+        temps.append(temp)
+        pieces.append(Piece(url, task.start, task.end, task.file.size, temp, 0))
 
     def on_done(index: int) -> None:
         task = tasks[index]
+        temp = temps[index]
         target = _local_path(dest, task.file.path)
-        with state_lock:
-            record = _record(state, task.file)
-            ranges = [tuple(pair) for pair in record.get("ranges") or []]
-            ranges.append((task.start, task.end))
-            record["ranges"] = _merge_ranges(ranges)
-            if _covers(record["ranges"], task.file.size):
-                record["complete"] = _hash_matches(target, task.file)
-                if not record["complete"] and task.file.sha256:
-                    target.unlink(missing_ok=True)
-                    record["ranges"] = []
+        try:
+            with file_locks[task.file.path]:
+                if generations[task.file.path] != captured[index]:
+                    meter.drop(task.end - task.start)
+                    return
+                with temp.open("rb") as src, target.open("r+b") as dst:
+                    dst.seek(task.start)
+                    shutil.copyfileobj(src, dst, length=1024 * 1024)
+                    dst.flush()
+                    os.fsync(dst.fileno())
+                with state_lock:
+                    record = _record(state, task.file)
+                    ranges = [tuple(pair) for pair in record.get("ranges") or []]
+                    ranges.append((task.start, task.end))
+                    record["ranges"] = _merge_ranges(ranges)
+                    if _covers(record["ranges"], task.file.size):
+                        record["complete"] = _hash_matches(target, task.file)
+                        if not record["complete"]:
+                            generations[task.file.path] += 1
+                            target.unlink(missing_ok=True)
+                            record["ranges"] = []
+                            _save_state(state_path, state)
+                            raise DownloadError(f"校验失败：{task.file.path}")
                     _save_state(state_path, state)
-                    raise DownloadError(f"校验失败：{task.file.path}")
-            _save_state(state_path, state)
+        finally:
+            temp.unlink(missing_ok=True)
         meter.commit(task.end - task.start)
         on_progress(task.file.path)
 
-    download_pieces(
-        pieces,
-        token=token,
-        allow_loopback_http=allow_loopback_http,
-        limiter=limiter,
-        cancel=cancel,
-        on_chunk=meter.add,
-        on_piece_done=on_done,
-        give_up=give_up,
-    )
+    try:
+        download_pieces(
+            pieces,
+            token=token,
+            allow_loopback_http=allow_loopback_http,
+            limiter=limiter,
+            cancel=cancel,
+            on_chunk=meter.add,
+            on_piece_done=on_done,
+            give_up=give_up,
+        )
+    finally:
+        for temp in temps:
+            temp.unlink(missing_ok=True)
 
 
 def _verify_file(dest: Path, item: RemoteFile, state: dict, state_path: Path) -> None:
@@ -752,6 +865,8 @@ def _verify_file(dest: Path, item: RemoteFile, state: dict, state_path: Path) ->
     path = _local_path(dest, item.path)
     if not path.is_file() or path.stat().st_size != item.size:
         raise DownloadError(f"文件不完整：{item.path}")
+    if item.size > 0 and not item.sha256 and not _covers(record.get("ranges") or [], item.size):
+        raise DownloadError(f"文件没有完整写入：{item.path}")
     if not _hash_matches(path, item):
         path.unlink(missing_ok=True)
         record["complete"] = False

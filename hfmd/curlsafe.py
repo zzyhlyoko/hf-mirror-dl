@@ -22,16 +22,18 @@ ALL_PROXY, CURL_HOME, or a home directory that would hold a curlrc.
 from __future__ import annotations
 
 import hashlib
+import ipaddress
 import os
 import platform
 import queue
+import re
 import subprocess
 import sys
 import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from urllib.parse import urlsplit
+from urllib.parse import urljoin, urlsplit, urlunsplit
 
 from hfmd.limiter import BandwidthLimiter
 
@@ -49,6 +51,14 @@ _SCUTIL_ENABLE = frozenset({
     "ProxyAutoConfigEnable",
 })
 _READ_SIZE = 64 * 1024
+_REDIRECTS = frozenset({301, 302, 303, 307, 308})
+_CDN_HOSTS = frozenset({"cas-bridge.xethub.hf.co"})
+_REWRITE_HOSTS = {"huggingface.co": "hf-mirror.com", "www.huggingface.co": "hf-mirror.com"}
+_CONNECTED_IP = re.compile(
+    r"Connected to \S+ \(([^)\s]+)\) port \d+"
+    r"|Established connection to \S+ \((\S+) port \d+\)"
+)
+_CGNAT = ipaddress.ip_network("100.64.0.0/10")
 _ENV_ALLOW = {
     "SYSTEMROOT",
     "WINDIR",
@@ -95,6 +105,24 @@ class PieceFailed(CurlError):
 
 class SlowTransfer(PieceFailed):
     """This connection is far behind the others, so its process was closed."""
+
+
+class RateLimited(PieceFailed):
+    """The mirror asked us to wait. retry_after is a number of seconds."""
+
+    def __init__(self, index: int, written: int, retry_after: float) -> None:
+        super().__init__("镜像限流", index, written)
+        self.retry_after = retry_after
+
+
+class RedirectRequired(CurlError):
+    """Follow one checked redirect. The message intentionally has no URL."""
+
+    def __init__(self, index: int, written: int, next_url: str) -> None:
+        super().__init__("需要跳转到允许的主机")
+        self.index = index
+        self.written = written
+        self.next_url = next_url
 
 
 @dataclass(frozen=True)
@@ -247,30 +275,68 @@ def get_bytes(
     cancel: threading.Event | None = None,
 ) -> tuple[bytes, str]:
     """GET a small body (API JSON). Returns (body, raw header dump)."""
-    check_initial_url(url, allow_loopback_http=allow_loopback_http)
-    header_path, body_path = _temp_pair("hfmd-api")
+    current = url
+    for _hop in range(6):
+        check_transfer_url(current, allow_loopback_http=allow_loopback_http)
+        header_path, body_path = _temp_pair("hfmd-api")
+        trace_path = header_path.with_suffix(".trace")
+        try:
+            proc = _popen(
+                current,
+                token=token if is_mirror_host(_host_of(current)) else None,
+                allow_loopback_http=allow_loopback_http,
+                header_path=header_path,
+                stdout_path=body_path,
+                range_header=None,
+                trace_path=trace_path,
+            )
+            try:
+                _wait_proc(proc, cancel, timeout=120)
+            finally:
+                _finish(proc)
+            _require_public_peers(trace_path, allow_loopback=allow_loopback_http)
+            status, hdrs = _final_headers(header_path)
+            if status in _REDIRECTS:
+                current = safe_redirect(current, hdrs.get("location", ""), allow_loopback=allow_loopback_http)
+                continue
+            _raise_if_failed(proc, header_path)
+            data = body_path.read_bytes()
+            if len(data) > max_bytes:
+                raise CurlError(f"响应超过 {max_bytes} 字节，已中止")
+            headers = header_path.read_text(encoding="utf-8", errors="replace")
+            return data, headers
+        finally:
+            header_path.unlink(missing_ok=True)
+            body_path.unlink(missing_ok=True)
+            trace_path.unlink(missing_ok=True)
+    raise CurlError("跳转次数过多，已停止")
+
+
+def probe_peer(url: str, *, allow_loopback_http: bool) -> None:
+    """Open one direct connection and require a public peer before any file is written."""
+    check_transfer_url(url, allow_loopback_http=allow_loopback_http)
+    header_path, body_path = _temp_pair("hfmd-probe")
+    trace_path = header_path.with_suffix(".trace")
     try:
         proc = _popen(
             url,
-            token=token,
+            token=None,
             allow_loopback_http=allow_loopback_http,
             header_path=header_path,
             stdout_path=body_path,
             range_header=None,
+            trace_path=trace_path,
+            fail=False,
         )
         try:
-            _wait_proc(proc, cancel, timeout=120)
+            _wait_proc(proc, None, timeout=30)
         finally:
             _finish(proc)
-        _raise_if_failed(proc, header_path)
-        data = body_path.read_bytes()
-        if len(data) > max_bytes:
-            raise CurlError(f"响应超过 {max_bytes} 字节，已中止")
-        headers = header_path.read_text(encoding="utf-8", errors="replace")
-        return data, headers
+        _require_public_peers(trace_path, allow_loopback=allow_loopback_http)
     finally:
         header_path.unlink(missing_ok=True)
         body_path.unlink(missing_ok=True)
+        trace_path.unlink(missing_ok=True)
 
 
 def download_to_file(
@@ -315,6 +381,7 @@ def piece_command(
     allow_loopback_http: bool,
     header_paths: list[Path],
     token: str | None,
+    trace_path: Path | None = None,
 ) -> list[str]:
     """One curl process, several ranges, so the TCP connection can be reused.
 
@@ -327,12 +394,13 @@ def piece_command(
         raise CurlError("token 含有换行，已拒绝")
     proto = "=http,https" if allow_loopback_http else "=https"
     cmd = command_prefix(allow_loopback_http=allow_loopback_http)
+    if trace_path is not None:
+        cmd += ["--trace-ascii", str(trace_path)]
     for index, piece in enumerate(pieces):
         if index:
             cmd.append("--next")
         partial = not (piece.start == 0 and piece.end == piece.total_size)
         cmd += [
-            "--location",
             "--fail-with-body",
             "--silent",
             "--show-error",
@@ -355,7 +423,7 @@ def piece_command(
         ]
         if partial:
             cmd += ["--range", f"{piece.start}-{piece.end - 1}"]
-        if token:
+        if token and is_mirror_host(_host_of(piece.url)):
             cmd += ["-H", f"Authorization: Bearer {token}"]
         cmd.append(piece.url)
     return cmd
@@ -385,7 +453,7 @@ def download_pieces(
     for piece in pieces:
         if piece.end < piece.start:
             raise CurlError("invalid range")
-        check_initial_url(piece.url, allow_loopback_http=allow_loopback_http)
+        check_transfer_url(piece.url, allow_loopback_http=allow_loopback_http)
         piece.dest.parent.mkdir(parents=True, exist_ok=True)
     if len(pieces) == 1 and pieces[0].end == pieces[0].start:
         pieces[0].dest.write_bytes(b"")
@@ -398,11 +466,13 @@ def download_pieces(
         header_path, _unused = _temp_pair("hfmd-hdr")
         _unused.unlink(missing_ok=True)
         header_paths.append(header_path)
+    trace_path = header_paths[0].with_suffix(".trace")
     cmd = piece_command(
         pieces,
         allow_loopback_http=allow_loopback_http,
         header_paths=header_paths,
         token=token,
+        trace_path=trace_path,
     )
     verify_bundled_curl()
     proc = subprocess.Popen(
@@ -436,6 +506,8 @@ def download_pieces(
                 piece,
                 index=index,
                 header_path=header_paths[index],
+                trace_path=trace_path,
+                allow_loopback_http=allow_loopback_http,
                 limiter=limiter,
                 cancel=cancel,
                 stall_seconds=stall_seconds,
@@ -460,16 +532,120 @@ def download_pieces(
         _finish(proc)
         for header_path in header_paths:
             header_path.unlink(missing_ok=True)
+        trace_path.unlink(missing_ok=True)
 
 
 def check_initial_url(url: str, *, allow_loopback_http: bool) -> None:
+    """The first URL of a user request. Redirect targets use check_transfer_url."""
+    check_transfer_url(url, allow_loopback_http=allow_loopback_http, allow_cdn=False)
+
+
+def check_transfer_url(url: str, *, allow_loopback_http: bool, allow_cdn: bool = True) -> None:
     parts = urlsplit(url)
     host = (parts.hostname or "").lower()
     if allow_loopback_http and parts.scheme == "http" and host in {"127.0.0.1", "localhost"}:
         return
-    if parts.scheme == "https" and (host == "hf-mirror.com" or host.endswith(".hf-mirror.com")):
+    if parts.scheme == "https" and is_mirror_host(host):
+        return
+    if allow_cdn and parts.scheme == "https" and host in _CDN_HOSTS:
         return
     raise CurlError("只允许直连 https://hf-mirror.com ，拒绝其它地址")
+
+
+def is_mirror_host(host: str) -> bool:
+    return host == "hf-mirror.com" or host.endswith(".hf-mirror.com")
+
+
+def is_public_ip(text: str, *, allow_loopback: bool) -> bool:
+    """True for a globally routable address. Loopback is allowed only in tests."""
+    try:
+        parsed = ipaddress.ip_address(text.strip().strip("[]"))
+    except ValueError:
+        return False
+    if isinstance(parsed, ipaddress.IPv6Address) and parsed.ipv4_mapped is not None:
+        parsed = parsed.ipv4_mapped
+    if allow_loopback and (parsed.is_loopback or parsed == ipaddress.ip_address("127.0.0.1")):
+        return True
+    if (
+        parsed.is_private
+        or parsed.is_loopback
+        or parsed.is_link_local
+        or parsed.is_multicast
+        or parsed.is_reserved
+        or parsed.is_unspecified
+    ):
+        return False
+    if isinstance(parsed, ipaddress.IPv4Address) and parsed in _CGNAT:
+        return False
+    return True
+
+
+def safe_redirect(current: str, location: str, *, allow_loopback: bool) -> str:
+    """Rewrite huggingface.co back to the mirror. Reject every other foreign host."""
+    if not location:
+        raise CurlError("跳转没有目标主机")
+    nxt = urljoin(current, location)
+    parts = urlsplit(nxt)
+    host = (parts.hostname or "").lower()
+    if host in _REWRITE_HOSTS:
+        replacement = _REWRITE_HOSTS[host]
+        port = parts.port
+        netloc = replacement if port is None else f"{replacement}:{port}"
+        nxt = urlunsplit(("https", netloc, parts.path, parts.query, ""))
+    check_transfer_url(nxt, allow_loopback_http=allow_loopback)
+    return nxt
+
+
+def _host_of(url: str) -> str:
+    return (urlsplit(url).hostname or "").lower()
+
+
+def _peer_ips(trace_text: str) -> list[str]:
+    found: list[str] = []
+    for match in _CONNECTED_IP.finditer(trace_text):
+        ip = match.group(1) or match.group(2) or ""
+        ip = ip.strip("[]")
+        if ip:
+            found.append(ip)
+    return found
+
+
+def _peers_ready(trace_path: Path, *, allow_loopback: bool) -> bool | None:
+    try:
+        text = trace_path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return None
+    ips = _peer_ips(text)
+    if not ips:
+        return None
+    for ip in ips:
+        if not is_public_ip(ip, allow_loopback=allow_loopback):
+            return False
+    return True
+
+
+def _retry_after_seconds(headers: dict[str, str]) -> float:
+    raw = headers.get("retry-after", "").strip()
+    try:
+        value = float(raw)
+    except ValueError:
+        return 5.0
+    if value < 1:
+        return 1.0
+    return min(value, 120.0)
+
+
+def _require_public_peers(trace_path: Path, *, allow_loopback: bool) -> None:
+    try:
+        text = trace_path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        text = ""
+    ips = _peer_ips(text)
+    if not ips:
+        raise CurlError("没有得到对端地址，已中止")
+    for ip in ips:
+        if not is_public_ip(ip, allow_loopback=allow_loopback):
+            raise CurlError("连接的对端不是公网地址，已中止")
 
 
 def system_proxy_enabled() -> bool:
@@ -552,32 +728,39 @@ def _popen(
     header_path: Path,
     stdout_path: Path | None,
     range_header: str | None,
+    trace_path: Path | None = None,
+    fail: bool = True,
 ) -> subprocess.Popen[bytes]:
     verify_bundled_curl()
     cmd = command_prefix(allow_loopback_http=allow_loopback_http)
+    if trace_path is not None:
+        cmd += ["--trace-ascii", str(trace_path)]
     cmd += [
-        "--location",
-        "--fail-with-body",
         "--silent",
         "--show-error",
         "--connect-timeout",
         "20",
-        "--retry",
-        "2",
-        "--retry-delay",
-        "1",
-        "--retry-all-errors",
         "-A",
         "hfmd/1.0",
         "-D",
         str(header_path),
     ]
+    if fail:
+        cmd += [
+            "--fail-with-body",
+            "--retry",
+            "2",
+            "--retry-delay",
+            "1",
+            "--retry-all-errors",
+        ]
     if range_header is not None:
         cmd += ["--range", range_header]
     if token:
         if "\r" in token or "\n" in token:
             raise CurlError("token 含有换行，已拒绝")
-        cmd += ["-H", f"Authorization: Bearer {token}"]
+        if is_mirror_host(_host_of(url)):
+            cmd += ["-H", f"Authorization: Bearer {token}"]
     if stdout_path is None:
         cmd += ["--output", "-"]
     else:
@@ -654,6 +837,8 @@ def _read_piece(
     *,
     index: int,
     header_path: Path,
+    trace_path: Path,
+    allow_loopback_http: bool,
     limiter: BandwidthLimiter,
     cancel: threading.Event | None,
     stall_seconds: float,
@@ -668,6 +853,7 @@ def _read_piece(
     written = 0
     started = time.monotonic()
     checked = False
+    peers_ok = False
     status: int | None = None
     headers: dict[str, str] = {}
     mode = "wb" if discard_on_failure else "r+b"
@@ -679,7 +865,24 @@ def _read_piece(
             if cancel is not None and cancel.is_set():
                 proc.kill()
                 raise Cancelled("已取消")
-            status, headers, _seen = _status_after(header_path, 0)
+            status, headers = _final_headers(header_path)
+            if status in _REDIRECTS:
+                proc.kill()
+                raise RedirectRequired(
+                    index,
+                    written,
+                    safe_redirect(piece.url, headers.get("location", ""), allow_loopback=allow_loopback_http),
+                )
+            if status == 429:
+                proc.kill()
+                raise RateLimited(index, written, _retry_after_seconds(headers))
+            if status in {200, 206} and peers_ok is not True:
+                ready = _peers_ready(trace_path, allow_loopback=allow_loopback_http)
+                if ready is False:
+                    proc.kill()
+                    raise PieceFailed("连接的对端不是公网地址，已中止", index, written)
+                if ready is True:
+                    peers_ok = True
             if partial and status == 200:
                 proc.kill()
                 raise RangeIgnored("服务器忽略了 Range", index, written)
@@ -699,7 +902,7 @@ def _read_piece(
             if give_up is not None and give_up(written + len(buf), time.monotonic() - started):
                 proc.kill()
                 raise SlowTransfer("这条连接明显慢于其它连接，已换一条", index, written)
-            if status in {200, 206} and (buf or leftover):
+            if status in {200, 206} and peers_ok is True and (buf or leftover):
                 pending = bytes(leftover) + bytes(buf)
                 leftover.clear()
                 buf.clear()
@@ -723,17 +926,24 @@ def _read_piece(
                     raise PieceFailed(str(item), index, written) from item
                 if item is None:
                     break
-            if status in {200, 206}:
+            if status in {200, 206} and peers_ok is True:
                 before = written
                 _accept_body(handle, item, expected, written, leftover, limiter, on_chunk)
                 written += min(len(item), expected - before)
             else:
                 buf.extend(item)
-                if len(buf) > 1024 * 1024:
+                if status not in {200, 206} and len(buf) > 1024 * 1024:
                     proc.kill()
                     raise PieceFailed("没有收到 HTTP 状态", index, written)
         if status is None:
-            status, headers, _seen = _status_after(header_path, 0)
+            status, headers = _final_headers(header_path)
+        if status in {200, 206} and peers_ok is not True:
+            ready = _peers_ready(trace_path, allow_loopback=allow_loopback_http)
+            if ready is not True:
+                proc.kill()
+                detail = "连接的对端不是公网地址，已中止" if ready is False else "没有得到对端地址，已中止"
+                raise PieceFailed(detail, index, written)
+            peers_ok = True
         if partial and status == 200:
             proc.kill()
             raise RangeIgnored("服务器忽略了 Range", index, written)

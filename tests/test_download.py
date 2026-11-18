@@ -7,7 +7,7 @@ import unittest
 from pathlib import Path
 
 from hfmd.cli import main
-from hfmd.download import DownloadError, RemoteFile, _plan, destination_for, download_model, parse_model
+from hfmd.download import DownloadError, RemoteFile, _Task, _plan, _split_task, destination_for, download_model, parse_model
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -31,6 +31,19 @@ class ModelPathTests(unittest.TestCase):
         self.assertTrue(all(task.start >= 4 * 1024 * 1024 for task in tasks))
         self.assertEqual(tasks[0].start, 4 * 1024 * 1024)
         self.assertEqual(tasks[-1].end, size)
+
+    def test_split_task_covers_the_range_without_tiny_pieces(self) -> None:
+        item = RemoteFile("weights.bin", 32 * 1024 * 1024, None)
+        task = _Task(item, 0, 32 * 1024 * 1024, 1, "https://hf-mirror.com/acme/tiny/resolve/main/weights.bin", 2)
+        pieces = _split_task(task, 8, task.tries)
+        self.assertGreater(len(pieces), 1)
+        self.assertEqual(pieces[0].start, 0)
+        self.assertEqual(pieces[-1].end, task.end)
+        self.assertEqual([piece.start for piece in pieces[1:]], [piece.end for piece in pieces[:-1]])
+        self.assertTrue(all(piece.end - piece.start >= 4 * 1024 * 1024 for piece in pieces))
+        self.assertTrue(all(piece.url == task.url and piece.hops == 2 and piece.tries == 1 for piece in pieces))
+        tiny = _Task(item, 0, 4 * 1024 * 1024)
+        self.assertEqual(len(_split_task(tiny, 8, 0)), 1)
 
     def test_cli_requires_concurrency_and_home(self) -> None:
         self.assertEqual(main(["download", "acme/tiny"]), 2)
