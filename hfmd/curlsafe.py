@@ -899,9 +899,10 @@ def _read_piece(
             if status is not None and status not in {200, 206}:
                 proc.kill()
                 raise PieceFailed(f"HTTP {status}", index, written)
-            if give_up is not None and give_up(written + len(buf), time.monotonic() - started):
+            if give_up is not None and give_up(written + len(buf), time.monotonic() - started, expected):
+                handle.flush()
                 proc.kill()
-                raise SlowTransfer("这条连接明显慢于其它连接，已换一条", index, written)
+                raise SlowTransfer("这条连接远低于应有速度，已拆开剩余部分", index, written)
             if status in {200, 206} and peers_ok is True and (buf or leftover):
                 pending = bytes(leftover) + bytes(buf)
                 leftover.clear()

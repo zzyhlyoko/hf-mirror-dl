@@ -4,10 +4,24 @@ import socket
 import threading
 import time
 import unittest
+from collections import deque
 from pathlib import Path
 
 from hfmd.cli import main
-from hfmd.download import DownloadError, RemoteFile, _Task, _plan, _split_task, destination_for, download_model, parse_model
+from hfmd.download import (
+    DownloadError,
+    RemoteFile,
+    _Task,
+    _plan,
+    _raise_watermark,
+    _remember_recent,
+    _splice_prefix,
+    _split_task,
+    _tail_cut_allowed,
+    destination_for,
+    download_model,
+    parse_model,
+)
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -44,6 +58,68 @@ class ModelPathTests(unittest.TestCase):
         self.assertTrue(all(piece.url == task.url and piece.hops == 2 and piece.tries == 1 for piece in pieces))
         tiny = _Task(item, 0, 4 * 1024 * 1024)
         self.assertEqual(len(_split_task(tiny, 8, 0)), 1)
+
+    def test_recent_speed_ignores_an_old_fast_start(self) -> None:
+        samples: deque[tuple[float, int]] = deque()
+        self.assertIsNone(_remember_recent(samples, 0.0, 0))
+        self.assertIsNone(_remember_recent(samples, 4.0, 8_000_000))
+        stalled = _remember_recent(samples, 16.0, 8_100_000)
+        self.assertIsNotNone(stalled)
+        assert stalled is not None
+        self.assertLess(stalled, 200_000)
+
+    def test_tail_cut_stops_a_slow_link_when_the_pack_is_slow(self) -> None:
+        common = dict(
+            aggregate_mbps=17.0,
+            sustained_mbps=250.0,
+            waiting_fraction=0.0,
+            fair_bps=2_000_000.0,
+            remaining=20 * 1024 * 1024,
+            larger_remainders=0,
+            cuts_in_window=0,
+        )
+        self.assertTrue(_tail_cut_allowed(recent_bps=100_000.0, **common))
+        self.assertFalse(_tail_cut_allowed(recent_bps=1_800_000.0, **common))
+        held = dict(common)
+        held["waiting_fraction"] = 0.3
+        self.assertFalse(_tail_cut_allowed(recent_bps=100_000.0, **held))
+        ceiling = dict(common)
+        ceiling["aggregate_mbps"] = 340.0
+        ceiling["sustained_mbps"] = 360.0
+        self.assertFalse(_tail_cut_allowed(recent_bps=100_000.0, **ceiling))
+        short = dict(common)
+        short["remaining"] = 1024 * 1024
+        self.assertFalse(_tail_cut_allowed(recent_bps=100_000.0, **short))
+        capped = dict(common)
+        capped["cuts_in_window"] = 4
+        self.assertFalse(_tail_cut_allowed(recent_bps=100_000.0, **capped))
+        crowded = dict(common)
+        crowded["larger_remainders"] = 4
+        self.assertFalse(_tail_cut_allowed(recent_bps=100_000.0, **crowded))
+
+    def test_watermark_remembers_a_held_rate_not_a_spike(self) -> None:
+        samples: deque[tuple[float, float]] = deque()
+        mark = 0.0
+        for second in range(12):
+            mark = _raise_watermark(samples, float(second), 40.0 if second == 6 else 320.0, mark)
+        self.assertGreater(mark, 250.0)
+        self.assertLess(mark, 340.0)
+        for second in range(12, 40):
+            mark = _raise_watermark(samples, float(second), 20.0, mark)
+        self.assertGreater(mark, 250.0)
+
+    def test_splice_prefix_keeps_only_the_downloaded_bytes(self) -> None:
+        home = ROOT / ".hfmd-test-home"
+        home.mkdir(parents=True, exist_ok=True)
+        temp = home / "piece"
+        target = home / "target"
+        temp.write_bytes(b"abcdefghij")
+        target.write_bytes(b"\0" * 8)
+        moved = _splice_prefix(temp, target, 2, 4)
+        self.assertEqual(moved, 4)
+        self.assertEqual(target.read_bytes(), b"\0\0abcd\0\0")
+        temp.unlink()
+        target.unlink()
 
     def test_cli_requires_concurrency_and_home(self) -> None:
         self.assertEqual(main(["download", "acme/tiny"]), 2)

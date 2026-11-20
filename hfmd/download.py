@@ -43,6 +43,8 @@ _MIN_CHUNK = 4 * 1024 * 1024
 _MAX_CHUNK = 32 * 1024 * 1024
 _BATCH = 4
 _TAIL_PARTS = 8
+_TAIL_CUTS = 4
+_CUT_WINDOW = 15.0
 _SLOW_TRIES = 2
 _INITIAL_WORKERS = 8
 _MAX_CONCURRENCY = 128
@@ -213,22 +215,59 @@ def download_model(
             return False
         return not _task_done(state, task)
 
-    def give_up(seen: int, elapsed: float) -> bool:
+    recent_samples: dict[int, deque[tuple[float, int]]] = {}
+    aggregate_samples: deque[tuple[float, float]] = deque()
+    sustained = [0.0]
+
+    def give_up(seen: int, elapsed: float, expected: int) -> bool:
+        key = threading.get_ident()
+        speed = _remember_recent(recent_samples.setdefault(key, deque()), time.monotonic(), seen)
+        if speed is None:
+            speed = seen / elapsed if elapsed > 0 else 0.0
         if elapsed < 15 or seen < 0:
             return False
-        speed = seen / elapsed
-        key = threading.get_ident()
         pace.publish(key, speed)
+        if _claim_tail_cut(key, speed, max(0, expected - seen)):
+            return True
+        if not median_enabled[0]:
+            return False
         peers, median = pace.median_others(key)
         if peers < 2 or median < 250_000:
-            # The last links used to be exempt. Split them when idle workers
-            # are waiting and this link is far below the shared cap.
-            if peers < 2 and waiting_workers[0] >= 1 and speed < bandwidth_mbps * 125_000 * 0.5:
-                return True
             return False
         if seen < 128 * 1024:
             return True
         return peers >= 4 and speed < median * 0.25
+
+    def _claim_tail_cut(key: int, recent_bps: float, remaining: int) -> bool:
+        aggregate = meter.speed_mbps()
+        waiting = limiter.waiting_fraction()
+        now = time.monotonic()
+        with idle_lock:
+            sustained[0] = _raise_watermark(aggregate_samples, now, aggregate, sustained[0])
+            # Fair share is the speed this download has already held, not the
+            # configured cap. A server that tops out at a few hundred Mbps
+            # must not look "too slow" just because the cap is higher.
+            fair = sustained[0] * 125_000 / max(1, count)
+            while cuts and now - cuts[0] > _CUT_WINDOW:
+                cuts.popleft()
+            fresh = {item: pair for item, pair in inflight.items() if now - pair[1] <= 20 and item != key}
+            inflight.clear()
+            inflight.update(fresh)
+            allowed = _tail_cut_allowed(
+                aggregate_mbps=aggregate,
+                sustained_mbps=sustained[0],
+                waiting_fraction=waiting,
+                recent_bps=recent_bps,
+                fair_bps=fair,
+                remaining=remaining,
+                larger_remainders=sum(1 for rem, _stamp in fresh.values() if rem > remaining),
+                cuts_in_window=len(cuts),
+            )
+            if not allowed:
+                return False
+            inflight[key] = (remaining, now)
+            cuts.append(now)
+            return True
 
     def run_batch(batch: list[_Task]) -> None:
         pending = [task for task in batch if usable(task)]
@@ -241,6 +280,7 @@ def download_model(
         if not pending:
             return
         allow_slow_kill = all(task.tries < _SLOW_TRIES for task in pending)
+        median_enabled[0] = allow_slow_kill
         delay = 1.0
         for attempt in range(1, 5):
             if cancel.is_set():
@@ -263,14 +303,22 @@ def download_model(
                     parts=parts,
                     meter=meter,
                     on_progress=emit_progress,
-                    give_up=give_up if allow_slow_kill else None,
+                    give_up=give_up,
                 )
                 return
             except SlowTransfer as exc:
-                meter.drop(exc.written)
                 failed = pending[exc.index]
-                for part in _split_task(failed, _TAIL_PARTS, failed.tries + 1):
-                    work.put(part)
+                if not getattr(exc, "skip", False):
+                    resume = failed.start + exc.written
+                    if resume < failed.end:
+                        pieces = _split_task(
+                            _Task(failed.file, resume, failed.end, failed.tries + 1, failed.url, failed.hops),
+                            min(_TAIL_PARTS, opened_workers[0]),
+                            failed.tries + 1,
+                        )
+                        for part in pieces:
+                            work.put(part)
+                        open_workers(len(pieces))
                 for task in pending[exc.index + 1 :]:
                     work.put(task)
                 return
@@ -370,6 +418,8 @@ def download_model(
                 cancel.set()
                 kill_all()
             finally:
+                with idle_lock:
+                    inflight.pop(threading.get_ident(), None)
                 for _item in batch:
                     work.task_done()
 
@@ -387,13 +437,26 @@ def download_model(
         opened_workers = [initial]
         waiting_workers = [0]
         idle_lock = threading.Lock()
+        inflight: dict[int, tuple[int, float]] = {}
+        cuts: deque[float] = deque()
+        median_enabled = [True]
+
+        def open_workers(limit: int) -> None:
+            if limit <= 0 or time.monotonic() < ramp_hold[0] or limiter.waiting_fraction() >= 0.25:
+                return
+            with idle_lock:
+                step = min(limit, count - opened_workers[0])
+                if step <= 0:
+                    return
+                for _permit in range(step):
+                    gate.release()
+                opened_workers[0] += step
 
         def grow() -> None:
-            opened = initial
-            while opened < count and not finished.is_set():
+            while not finished.is_set():
                 if finished.wait(6):
                     return
-                if cancel.is_set() or errors or work.empty():
+                if cancel.is_set() or errors:
                     continue
                 if time.monotonic() < ramp_hold[0]:
                     continue
@@ -401,11 +464,11 @@ def download_model(
                     continue
                 if limiter.waiting_fraction() >= 0.25:
                     continue
-                step = min(8, count - opened)
-                for _permit in range(step):
-                    gate.release()
-                opened += step
-                opened_workers[0] = opened
+                # An empty queue used to freeze the ramp while slow curls still
+                # held the tail. Keep releasing workers when the cap is unmet.
+                if work.empty() and meter.speed_mbps() >= bandwidth_mbps * 0.5:
+                    continue
+                open_workers(8)
 
         for _permit in range(initial):
             gate.release()
@@ -611,6 +674,84 @@ def _safe_rel(path: str) -> str:
     return "/".join(parts)
 
 
+def _remember_recent(samples: deque[tuple[float, int]], now: float, seen: int) -> float | None:
+    """Bytes per second over the last 15 seconds. None until the window is 5 seconds."""
+    if samples and seen < samples[-1][1]:
+        samples.clear()
+    if not samples or now - samples[-1][0] >= 0.5:
+        samples.append((now, seen))
+    else:
+        samples[-1] = (samples[-1][0], seen)
+    cutoff = now - 15
+    while len(samples) > 2 and samples[0][0] < cutoff:
+        samples.popleft()
+    span = samples[-1][0] - samples[0][0]
+    if span < 5:
+        return None
+    return (samples[-1][1] - samples[0][1]) / span
+
+
+def _raise_watermark(
+    samples: deque[tuple[float, float]], now: float, mbps: float, watermark: float
+) -> float:
+    """Highest aggregate speed held for about ten seconds. Short spikes do not count."""
+    samples.append((now, mbps))
+    cutoff = now - 20
+    while len(samples) > 2 and samples[0][0] < cutoff:
+        samples.popleft()
+    if samples[-1][0] - samples[0][0] < 10:
+        return watermark
+    average = sum(value for _stamp, value in samples) / len(samples)
+    return max(watermark, average)
+
+
+def _tail_cut_allowed(
+    *,
+    aggregate_mbps: float,
+    sustained_mbps: float,
+    waiting_fraction: float,
+    recent_bps: float,
+    fair_bps: float,
+    remaining: int,
+    larger_remainders: int,
+    cuts_in_window: int,
+) -> bool:
+    """True when this in-flight range should be split so idle connections can take it."""
+    if remaining < _MIN_CHUNK * 2:
+        return False
+    if recent_bps >= fair_bps * 0.8:
+        return False
+    if waiting_fraction >= 0.25:
+        return False
+    # Collapse relative to the speed already achieved. A steady rate below the
+    # configured cap is the server's own ceiling, not a reason to reconnect.
+    if sustained_mbps < 1 or aggregate_mbps >= sustained_mbps * 0.5:
+        return False
+    if cuts_in_window >= _TAIL_CUTS or larger_remainders >= _TAIL_CUTS:
+        return False
+    return True
+
+
+def _splice_prefix(temp: Path, target: Path, offset: int, nbytes: int) -> int:
+    """Copy the first nbytes of a finished-so-far piece into the destination."""
+    if nbytes <= 0:
+        return 0
+    moved = 0
+    with temp.open("rb") as src, target.open("r+b") as dst:
+        dst.seek(offset)
+        left = nbytes
+        while left > 0:
+            chunk = src.read(min(1024 * 1024, left))
+            if not chunk:
+                break
+            dst.write(chunk)
+            moved += len(chunk)
+            left -= len(chunk)
+        dst.flush()
+        os.fsync(dst.fileno())
+    return moved
+
+
 def _split_task(task: _Task, parts: int, tries: int) -> list[_Task]:
     """Divide one range so idle workers can download the tail in parallel."""
     span = task.end - task.start
@@ -791,7 +932,7 @@ def _transfer_batch(
     parts: Path,
     meter: _Meter,
     on_progress: Callable[[str], None],
-    give_up: Callable[[int, float], bool] | None,
+    give_up: Callable[[int, float, int], bool] | None,
 ) -> None:
     pieces: list[Piece] = []
     captured: list[int] = []
@@ -844,6 +985,30 @@ def _transfer_batch(
         meter.commit(task.end - task.start)
         on_progress(task.file.path)
 
+    def keep_prefix(index: int, nbytes: int) -> tuple[int, bool]:
+        """Keep a partial piece. The bool tells the caller not to requeue it."""
+        if nbytes <= 0 or index >= len(tasks):
+            return 0, False
+        task = tasks[index]
+        target = _local_path(dest, task.file.path)
+        with file_locks[task.file.path]:
+            if generations[task.file.path] != captured[index]:
+                meter.drop(nbytes)
+                return 0, True
+            moved = _splice_prefix(temps[index], target, task.start, nbytes)
+            if moved < nbytes:
+                meter.drop(nbytes - moved)
+            if moved <= 0:
+                return 0, False
+            with state_lock:
+                record = _record(state, task.file)
+                ranges = [tuple(pair) for pair in record.get("ranges") or []]
+                ranges.append((task.start, task.start + moved))
+                record["ranges"] = _merge_ranges(ranges)
+                _save_state(state_path, state)
+            meter.commit(moved)
+            return moved, False
+
     try:
         download_pieces(
             pieces,
@@ -855,6 +1020,9 @@ def _transfer_batch(
             on_piece_done=on_done,
             give_up=give_up,
         )
+    except SlowTransfer as exc:
+        exc.written, exc.skip = keep_prefix(exc.index, exc.written)
+        raise
     finally:
         for temp in temps:
             temp.unlink(missing_ok=True)
